@@ -1,0 +1,32 @@
+[package]
+name = "dojo-signer"
+version = "0.1.0"
+edition = "2021"
+description = "DOJO SIGNER — First hardware wallet support for Samurai Wallet / Ashigaru Whirlpool coinjoin on Passport Prime"
+
+[dependencies]
+# KeyOS API (provided by the SDK environment)
+keyos = "*"
+keyos-slint = "*"
+slint = "1"
+
+# Serde for data exchange
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hex and Base58 encoding
+hex = "0.4"
+hex-literal = "0.4"
+
+# Base58 encoding (BIP47 payment codes) — no_std compatible
+bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
+
+# Z85 encoding (Whirlpool protocol uses Z85 for witnesses64, transaction64)
+# TODO: Add z85 crate once the exact version compatible with KeyOS SDK is confirmed
+# z85 = "3.0"
+
+# Bluetooth communication
+btle = "0.4"
+
+# QR scanning
+rxing = "0.8"
