@@ -1,0 +1,68 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component SendPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Send Bitcoin"; color: #ff0000; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Bitcoin Address"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.send-address;
+                    color: #fff; font-size: 10px;
+                }
+
+                Rectangle {
+                    height: 18px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                    TouchArea { clicked => { CB.scan-qr-address(); } }
+                    Text { text: "📷 Scan QR"; color: #0aa; font-size: 10px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: "Amount (sats)"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.send-amount;
+                    color: #fff; font-size: 10px;
+                }
+
+                Text { text: "Fee (sats)"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.send-fee;
+                    color: #fff; font-size: 10px;
+                }
+
+                Rectangle {
+                    height: 24px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                    TouchArea {
+                        clicked => { CB.send-btc(CB.send-address, CB.send-amount, CB.send-fee); }
+                    }
+                    Text {
+                        text: "SEND BITCOIN";
+                        color: #f44; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+
+                Text { text: CB.send-status; color: #0f0; font-size: 9px; }
+                Text { text: CB.send-error; color: #f00; font-size: 9px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

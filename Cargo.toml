@@ -1,32 +1,27 @@
 [package]
-name = "dojo-signer"
+name = "gui-app-dojo-signer"
 version = "0.1.0"
 edition = "2021"
-description = "DOJO SIGNER — First hardware wallet support for Samurai Wallet / Ashigaru Whirlpool coinjoin on Passport Prime"
 
 [dependencies]
-# KeyOS API (provided by the SDK environment)
-keyos = "*"
-keyos-slint = "*"
-slint = "1"
+anyhow = { workspace = true }
+crypto = { workspace = true }
+foundation-ur = { workspace = true }
+foundation-urtypes = { workspace = true }
+fs = { workspace = true }
+hex = { workspace = true }
+log = { workspace = true }
+log-server = { workspace = true }
+minicbor = { version = "0.24", features = ["std", "derive"] }
+ngwallet = { workspace = true }
+ql-utils = { workspace = true }
+quantum-link = { workspace = true }
+security = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+server = { workspace = true }
+slint-keyos-platform = { path = "../../slint-keyos-platform/runtime" }
+thiserror = { workspace = true }
 
-# Serde for data exchange
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Hex and Base58 encoding
-hex = "0.4"
-hex-literal = "0.4"
-
-# Base58 encoding (BIP47 payment codes) — no_std compatible
-bs58 = { version = "0.5", default-features = false, features = ["alloc"] }
-
-# Z85 encoding (Whirlpool protocol uses Z85 for witnesses64, transaction64)
-# TODO: Add z85 crate once the exact version compatible with KeyOS SDK is confirmed
-# z85 = "3.0"
-
-# Bluetooth communication
-btle = "0.4"
-
-# QR scanning
-rxing = "0.8"
+[build-dependencies]
+slint-keyos-platform-build = { path = "../../slint-keyos-platform/build" }

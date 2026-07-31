@@ -1,0 +1,83 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component SettingsPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Node Settings"; color: #ffaa00; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Host"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.host-input;
+                    color: #fff; font-size: 10px;
+                }
+
+                Text { text: "Port"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.port-input;
+                    color: #fff; font-size: 10px;
+                }
+
+                Text { text: "Use SSL/TLS"; color: #888; font-size: 10px; }
+                Rectangle {
+                    height: 20px; background: CB.ssl-input ? #041 : #200;
+                    border-radius: 2px; border-width: 1px; border-color: CB.ssl-input ? #0a0 : #500;
+                    TouchArea { clicked => { CB.ssl-input = !CB.ssl-input; } }
+                    Text { text: CB.ssl-input ? "SSL: ON" : "SSL: OFF"; color: #fff; font-size: 10px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: "Username (optional)"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.username-input;
+                    color: #fff; font-size: 10px;
+                }
+
+                Text { text: "Password (optional)"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.password-input;
+                    color: #fff; font-size: 10px;
+                }
+
+                GridLayout { spacing: 4px;
+                    Rectangle {
+                        height: 24px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;
+                        TouchArea {
+                            clicked => {
+                                CB.connect-node(CB.host-input, CB.port-input, CB.ssl-input, CB.username-input, CB.password-input);
+                            }
+                        }
+                        Text { text: "CONNECT"; color: #0f0; font-size: 12px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 24px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                        TouchArea { clicked => { CB.disconnect-node(); } }
+                        Text { text: "DISCONNECT"; color: #f44; font-size: 12px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Text { text: "Status: " + CB.node-status; color: #888; font-size: 10px; }
+                Text { text: "BLE Companion: " + CB.ble-status; color: #888; font-size: 10px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

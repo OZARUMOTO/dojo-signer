@@ -1,0 +1,22 @@
+manifestVersion = "0"
+appId = "0x444f4a4f205349474e45520000000000"
+
+[appName]
+en = "DOJO SIGNER"
+
+[permissions]
+template = ["gui-app", "fs-generic"]
+"os/gui-server" = ["GetPendingNavRequest"]
+"os/security" = ["GetSeed", "GetSeedFingerprint", "GetDeviceId"]
+"os/quantum-link" = [
+    "SendAccountUpdate",
+    "PublishPsbt",
+    "SubscribeSignPsbt",
+    "SubscribeAccountUpdate",
+    "SubscribeConnectionStatus",
+    "SubscribePairingEvent",
+]
+"os/fs" = [
+    "GetUserReadAccess",
+    "GetUserWriteAccess",
+]

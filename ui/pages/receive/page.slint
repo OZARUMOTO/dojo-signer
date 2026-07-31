@@ -1,0 +1,64 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component ReceivePage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Receive Bitcoin"; color: #00ff00; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "BIP84 SegWit Address (m/84'/0'/0'/0/0)"; color: #888; font-size: 9px; }
+
+                Rectangle {
+                    background: #111; border-radius: 2px; border-width: 1px; border-color: #333;
+                    min-height: 40px;
+                    VerticalLayout { padding: 4px;
+                        Text {
+                            text: CB.receive-address;
+                            color: #0f0; font-size: 11px; font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                Image {
+                    source: CB.receive-qr-image;
+                    height: 130px;
+                    width: 130px;
+                    visible: CB.show-receive-qr;
+                    horizontal-alignment: center;
+                }
+
+                Text { text: CB.receive-error; color: #f00; font-size: 9px; }
+
+                Rectangle {
+                    height: 24px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;
+                    TouchArea { clicked => { CB.receive-new-address(); } }
+                    Text {
+                        text: "Generate Address";
+                        color: #0f0; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+
+                Text { text: "Share this address to receive BTC directly on your device."; color: #666; font-size: 9px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

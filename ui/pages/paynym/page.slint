@@ -1,0 +1,78 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component PayNymPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# PayNym Identity"; color: #ff4040; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: CB.paynym.name; color: #ff4040; font-size: 16px; font-weight: 800; }
+
+                Text { text: "Payment Code"; color: #888; font-size: 9px; }
+                Rectangle { background: #111; border-radius: 2px; min-height: 20px;
+                    VerticalLayout { padding: 4px;
+                        Text { text: CB.paynym.payment_code; color: #ccc; font-size: 9px; wrap: word-wrap; }
+                    }
+                }
+
+                Text { text: "Pepehash"; color: #888; font-size: 9px; }
+                Text { text: CB.paynym.pepehash; color: #aaa; font-size: 9px; }
+
+                Text { text: "Notification Address (P2PKH)"; color: #888; font-size: 9px; }
+                Text { text: CB.paynym.notification_address; color: #0a0; font-size: 9px; wrap: word-wrap; }
+
+                Text { text: "Your PayNym is derived from your device seed. Share your payment code to receive BIP47 payments."; color: #555; font-size: 9px; }
+
+                Image {
+                    source: CB.paynym-qr-image;
+                    height: 130px;
+                    width: 130px;
+                    visible: CB.show-paynym-qr;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Scanned Contact";
+                    color: #888; font-size: 9px;
+                    visible: CB.scanned-contact != "";
+                }
+                Text {
+                    text: CB.scanned-contact;
+                    color: #0aa; font-size: 9px; wrap: word-wrap;
+                    visible: CB.scanned-contact != "";
+                }
+
+                Rectangle {
+                    height: 24px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                    TouchArea { clicked => { CB.export-paynym-qr(CB.paynym.payment_code); } }
+                    Text { text: "📷 Show QR"; color: #f44; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    height: 24px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                    TouchArea { clicked => { CB.scan-paynym-qr(); } }
+                    Text { text: "📷 Scan Contact"; color: #0aa; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

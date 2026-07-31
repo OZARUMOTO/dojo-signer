@@ -1,0 +1,101 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component HomePage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        // Title bar
+        Rectangle {
+            height: 24px; background: #0a0000; border-radius: 2px;
+            VerticalLayout { padding: 2px;
+                Text {
+                    text: "☯ DOJO SIGNER";
+                    color: #ff2020; font-size: 14px; font-weight: 800;
+                }
+            }
+        }
+
+        // PayNym Identity Card
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px; spacing: 2px;
+                Text { text: CB.paynym.name; color: #ff4040; font-size: 13px; font-weight: 700; }
+                Text { text: CB.paynym.payment_code; color: #888; font-size: 9px; }
+                Text { text: CB.paynym.pepehash; color: #555; font-size: 9px; }
+                Text { text: "⚡ " + CB.connection-status; color: #0f0; font-size: 9px; }
+                Text { text: "💰 " + CB.balance-display; color: #0f0; font-size: 11px; font-weight: 600; }
+                Text { text: "📡 BLE: " + CB.ble-status; color: #888; font-size: 9px; }
+            }
+        }
+
+        // 8 Navigation Buttons in 4 rows x 2 cols
+        GridLayout { spacing: 3px;
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "SEND"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-send(); } }
+                }
+            }
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "RECEIVE"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-receive(); } }
+                }
+            }
+        }
+
+        GridLayout { spacing: 3px;
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "PAYNIM"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-pay-nym(); } }
+                }
+            }
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "UTXOs"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-utxo(); } }
+                }
+            }
+        }
+
+        GridLayout { spacing: 3px;
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "COINJOIN"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-coinjoin(); } }
+                }
+            }
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "VERIFY"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-verify(); } }
+                }
+            }
+        }
+
+        GridLayout { spacing: 3px;
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "NODE"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-settings(); } }
+                }
+            }
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "REFRESH"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.refresh-identity(); } }
+                }
+            }
+        }
+    }
+}

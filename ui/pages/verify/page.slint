@@ -1,0 +1,58 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component VerifyPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Verify BIP47"; color: #00aaaa; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Verify a BIP47-signed message. Paste the message, signature and sender payment code, then tap VERIFY."; color: #888; font-size: 10px; }
+
+                Text { text: "Message"; color: #888; font-size: 9px; }
+                TextInput { text <=> CB.verify-message-input; color: #fff; font-size: 10px; }
+
+                Text { text: "Signature (base64)"; color: #888; font-size: 9px; }
+                TextInput { text <=> CB.verify-signature-input; color: #fff; font-size: 10px; }
+
+                Text { text: "Sender Payment Code"; color: #888; font-size: 9px; }
+                TextInput { text <=> CB.verify-paycode-input; color: #fff; font-size: 10px; }
+
+                Rectangle {
+                    height: 24px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                    TouchArea { clicked => { CB.verify-message(CB.verify-message-input, CB.verify-signature-input, CB.verify-paycode-input); } }
+                    Text { text: "✅ VERIFY"; color: #0aa; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    height: 18px; background: #022; border-radius: 2px; border-width: 1px; border-color: #033;
+                    TouchArea { clicked => { CB.scan-verify-qr(); } }
+                    Text { text: "📷 Scan QR instead"; color: #0aa; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: CB.verify-result; color: #0aa; font-size: 9px; }
+                Text { text: CB.verify-error; color: #f00; font-size: 9px; }
+                Text { text: "History:"; color: #555; font-size: 8px; }
+                Text { text: CB.verify-history; color: #4a4; font-size: 8px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

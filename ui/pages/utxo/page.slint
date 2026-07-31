@@ -1,0 +1,43 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component UtxoPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# UTXO Coin Control"; color: #ffaa00; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "count: " + CB.utxo-summary.total_count; color: #ff4040; font-size: 14px; font-weight: 700; }
+                Text { text: "sats: " + CB.utxo-summary.total_value_sats; color: #cc0000; font-size: 11px; }
+                Text { text: "doxxic: " + CB.utxo-summary.doxxic_count + " (" + CB.utxo-summary.doxxic_value_sats + " sats)"; color: #cc0000; font-size: 11px; }
+                Text { text: "premix: " + CB.utxo-summary.premix_count + " / postmix: " + CB.utxo-summary.postmix_count; color: #cc6600; font-size: 11px; }
+                Text { text: "avg anonset: " + CB.utxo-summary.avg_anonset; color: #660000; font-size: 11px; }
+
+                Text { text: "UTXO data syncs via the BLE companion app once your node is connected."; color: #555; font-size: 9px; }
+
+                Rectangle {
+                    height: 20px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                    TouchArea { clicked => { CB.refresh-balance(); } }
+                    Text { text: "🔄 REFRESH UTXOs"; color: #fa0; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

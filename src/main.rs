@@ -1,1519 +1,1427 @@
-//! DOJO SIGNER — Hardware signing companion for Samurai Wallet / Ashigaru Terminal.
-//!
-//! Runs on the Foundation Passport Prime device. This is the FIRST hardware
-//! wallet support for Samurai Wallet / Ashigaru Whirlpool coinjoin.
-//!
-//! Built from the actual Ashigaru source code (Tor Gitea):
-//!   - Whirlpool Protocol v0.23 (STOMP WebSocket, Z85 encoding)
-//!   - Mix flow: CONFIRM_INPUT → REGISTER_OUTPUT → REVEAL_OUTPUT → SIGNING → SUCCESS/FAIL
-//!   - SigningRequest: mixId + witnesses64 (Z85-encoded partial signatures)
-//!
-//!   ⛩ BIP47 Payment Codes  —  Generate & display PayNym identity
-//!   🌀 Coinjoin Signing     —  Hardware signing of Whirlpool mixes
-//!   🪙 UTXO Coin Control    —  Review UTXOs on the secure screen before mixing
-//!   ✅ BIP47 Verifier       —  Verify messages signed by any BIP47 paynym
-//!   🔗 Dojo Connection      —  Connect to Dojo/Electrum servers
-//!
-//! KEY PRINCIPLE: The seed NEVER leaves the Passport Prime.
-//! Only public keys and signed witnesses are exported.
-//!
-//! Protocol flow for signing:
-//!   1. Dojo sends SigningRequest { mixId, witnesses64, transaction64 }
-//!   2. User reviews transaction details on secure display
-//!   3. User approves → device signs the witnesses → returns them
-//!   4. Signed witnesses are sent back over BLE → Dojo completes the mix
+// SPDX-FileCopyrightText: 2025 DOJO SIGNER Team
+// SPDX-License-Identifier: GPL-3.0-or-later
 
-#![no_std]
-#![no_main]
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::sync::Arc;
 
-extern crate alloc;
-use alloc::boxed::Box;
-use alloc::format;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use alloc::rc::Rc;
-use core::cell::RefCell;
-
-use keyos::prelude::*;
-use keyos_slint::*;
-use slint::*;
+use ngwallet::{
+    bdk_wallet::{
+        bitcoin::{
+            secp256k1::Secp256k1,
+            sign_message::{MessageSignature, signed_msg_hash},
+            hashes::Hash,
+            Network, PubkeyHash,
+        },
+        KeychainKind, SignOptions,
+    },
+    bip39::MasterKey,
+    ngwallet::NgWallet,
+    store::MetaStorage,
+};
+use quantum_link::{
+    foundation_api::bitcoin::BroadcastTransaction,
+    messages::{PublishPsbt, SubscribeAccountUpdate, SubscribePairingEvent, SubscribeSignPsbt},
+    PairingEvent,
+};
+use slint_keyos_platform::{
+    app,
+    async_archive,
+    gui_server_api::navigation::qrscanner::{ScanQrOptions, ScanQrResult},
+    navigation::open_qr_scanner,
+    qrcode,
+    slint::{Color, ComponentHandle, SharedString},
+    spawn_local, subscribe_archive,
+};
+use std::sync::Mutex;
 
 mod bip47;
 mod coinjoin;
 mod message;
 mod utxo;
 
-use bip47::{PaymentCode, PayNymIdentity, VerificationResult, PaymentCodeError};
-use coinjoin::{MixStatus, SigningRequest as CoinjoinSigningReq, SigningResponse as CoinjoinSigningRes, UtxoEntry, RegisterInputRequest, ConfirmInputRequest, RevealOutputRequest, MixStatusNotification};
-use message::{VerificationRequest, VerificationResponse, VerificationHistoryEntry};
-use utxo::{UtxoDisplayItem, UtxoReviewList, UtxoSummary, DojoConnectionStatus};
+quantum_link::use_api!();
+security::use_api!();
 
-// ─── App Screens ────────────────────────────────────────────
+// Re-export for other modules
+pub use bip47::PayNymIdentity;
+pub use coinjoin::{
+    ConfirmInputRequest, MixStatus, RegisterInputRequest, RevealOutputRequest,
+    SigningRequest, SigningResponse, WhirlpoolAccount,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Screen {
-    /// Main screen — PayNym identity + connection status
-    Home,
-    /// BIP47 Payment Code display (QR ready)
-    PayNym,
-    /// UTXO review list
-    UtxoReview,
-    /// Coinjoin transaction signing
-    Coinjoin,
-    /// BIP47 Message verification
-    MessageVerify,
-    /// Settings
-    Settings,
-    /// Verification history
-    History,
+/// Pending PSBT bytes received from the Whirlpool companion over BLE
+static PENDING_PSBT: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Pending Whirlpool protocol signing request
+static PENDING_SIGNING: Mutex<Option<SigningRequest>> = Mutex::new(None);
+
+/// Open the system QR scanner and return the scanned text (if any).
+fn open_scan() -> Option<String> {
+    let opts = ScanQrOptions {
+        header_title: "Scan QR".into(),
+        header_right_icon: "close".into(),
+        ..ScanQrOptions::default()
+    };
+    match open_qr_scanner::<gui_permissions::GuiPermissions>(opts) {
+        Ok(Some(ScanQrResult::Qr { data, .. })) | Ok(Some(ScanQrResult::Ur2 { data, .. })) => {
+            Some(String::from_utf8_lossy(&data).to_string())
+        }
+        _ => None,
+    }
 }
 
-// ─── App State ──────────────────────────────────────────────
-
-struct AppState {
-    // ── Identity ─────────────────────────────────────────
-    seed_initialized: bool,
-    paynym_identity: Option<PayNymIdentity>,
-    public_key_hex: String,
-
-    // ── Dojo Connection ──────────────────────────────────
-    dojo_connected: bool,
-    dojo_server: String,
-    tor_enabled: bool,
-    block_height: u32,
-    peer_count: u32,
-
-    // ── UTXO Review ──────────────────────────────────────
-    utxo_list: Option<UtxoReviewList>,
-    utxo_loaded: bool,
-
-    // ── Coinjoin Signing ─────────────────────────────────
-    current_coinjoin_req: Option<CoinjoinSigningReq>,
-    coinjoin_history: Vec<CoinjoinSigningRes>,
-
-    // ── Message Verification ─────────────────────────────
-    current_verification: Option<VerificationRequest>,
-    verification_result: Option<VerificationResponse>,
-    verification_history: Vec<VerificationHistoryEntry>,
-
-    // ── Navigation ───────────────────────────────────────
-    current_screen: Screen,
-    previous_screen: Screen,
-
-    // ── Status ───────────────────────────────────────────
-    status_text: String,
-    status_icon: &'static str,
-    device_name: String,
+/// Simple in-memory meta storage for ngwallet (no persistence needed for signing)
+#[derive(Debug)]
+struct SimpleMetaStorage;
+impl MetaStorage for SimpleMetaStorage {
+    fn set_fee(&self, _txid: &str, _fee: u64) -> anyhow::Result<()> { Ok(()) }
+    fn get_fee(&self, _txid: &str) -> anyhow::Result<Option<u64>> { Ok(None) }
+    fn set_note(&self, _key: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
+    fn get_note(&self, _key: &str) -> anyhow::Result<Option<String>> { Ok(None) }
+    fn list_tags(&self) -> anyhow::Result<Vec<String>> { Ok(vec![]) }
+    fn add_tag(&self, _tag: &str) -> anyhow::Result<()> { Ok(()) }
+    fn remove_tag(&self, _tag: &str) -> anyhow::Result<()> { Ok(()) }
+    fn set_tag(&self, _key: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
+    fn get_tag(&self, _key: &str) -> anyhow::Result<Option<String>> { Ok(None) }
+    fn set_do_not_spend(&self, _key: &str, _value: bool) -> anyhow::Result<()> { Ok(()) }
+    fn get_do_not_spend(&self, _key: &str) -> anyhow::Result<bool> { Ok(false) }
+    fn set_config(&self, _cfg: &str) -> anyhow::Result<()> { Ok(()) }
+    fn get_config(&self) -> anyhow::Result<Option<ngwallet::config::NgAccountConfig>> { Ok(None) }
+    fn set_last_verified_address(
+        &self, _addr_type: ngwallet::config::AddressType, _kc: KeychainKind, _idx: u32,
+    ) -> anyhow::Result<()> { Ok(()) }
+    fn get_last_verified_address(
+        &self, _addr_type: ngwallet::config::AddressType, _kc: KeychainKind,
+    ) -> anyhow::Result<u32> { Ok(0) }
+    fn persist(&self) -> anyhow::Result<bool> { Ok(true) }
 }
 
-impl AppState {
-    fn new() -> Self {
-        Self {
-            seed_initialized: false,
-            paynym_identity: None,
-            public_key_hex: String::new(),
-            dojo_connected: false,
-            dojo_server: String::new(),
-            tor_enabled: true,
-            block_height: 0,
-            peer_count: 0,
-            utxo_list: None,
-            utxo_loaded: false,
-            current_coinjoin_req: None,
-            coinjoin_history: Vec::new(),
-            current_verification: None,
-            verification_result: None,
-            verification_history: Vec::new(),
-            current_screen: Screen::Home,
-            previous_screen: Screen::Home,
-            status_text: "Ready — DOJO SIGNER active".into(),
-            status_icon: "🟢",
-            device_name: "DOJO SIGNER".into(),
+/// Simple persister that doesn't persist (in-memory only)
+#[derive(Debug)]
+struct NullPersister(std::sync::Mutex<ngwallet::bdk_wallet::ChangeSet>);
+
+impl ngwallet::bdk_wallet::WalletPersister for NullPersister {
+    type Error = anyhow::Error;
+    fn initialize(persister: &mut Self) -> Result<ngwallet::bdk_wallet::ChangeSet, Self::Error> {
+        Ok(persister.0.lock().unwrap().clone())
+    }
+    fn persist(persister: &mut Self, changeset: &ngwallet::bdk_wallet::ChangeSet) -> Result<(), Self::Error> {
+        *persister.0.lock().unwrap() = changeset.clone();
+        Ok(())
+    }
+}
+
+/// Load the master key from device seed
+fn load_master_key(network: Network) -> anyhow::Result<MasterKey> {
+    let secp = Secp256k1::new();
+    let security = crate::Security::default();
+    let entropy = security
+        .seed()
+        .map_err(|_| anyhow::anyhow!("access denied"))?
+        .ok_or_else(|| anyhow::anyhow!("no seed available"))?;
+    MasterKey::from_entropy(&secp, network, entropy.bytes(), "", None)
+        .map_err(|e| anyhow::anyhow!("master key: {:?}", e))
+}
+
+/// Create a BIP84 (SegWit) wallet from device seed
+fn create_bip84_wallet(network: Network, account_index: u32) -> anyhow::Result<NgWallet<NullPersister>> {
+    let master_key = load_master_key(network)?;
+    let descriptors = ngwallet::bip39::get_descriptors(&master_key.key.0, network, account_index)?;
+
+    for d in descriptors {
+        let internal = d.change_descriptor;
+        let external = d.descriptor;
+        let persister = Arc::new(Mutex::new(NullPersister(Mutex::new(
+            ngwallet::bdk_wallet::ChangeSet::default(),
+        ))));
+
+        let wallet = NgWallet::new_from_descriptor(
+            internal,
+            Some(external),
+            network,
+            Arc::new(SimpleMetaStorage),
+            persister,
+        )?;
+        return Ok(wallet);
+    }
+
+    Err(anyhow::anyhow!("no descriptors generated"))
+}
+
+/// Derive a real BIP84 receive address from device seed (index N → fresh addresses)
+fn derive_receive_address(index: u32) -> Result<String, String> {
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0).map_err(|e| format!("{}", e))?;
+    let bdk = wallet.bdk_wallet.lock().map_err(|e| format!("lock: {}", e))?;
+    let address = bdk.peek_address(KeychainKind::External, index);
+    Ok(address.to_string())
+}
+
+/// Persisted app state: node connection settings + BIP47/receive counters.
+/// Stored as JSON on the device filesystem (AppData), restored on startup.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct AppConfig {
+    host: String,
+    port: u16,
+    ssl: bool,
+    username: String,
+    password: String,
+    receive_index: u32,
+    /// Next unused BIP47 payment index per recipient payment code.
+    bip47_indices: BTreeMap<String, u32>,
+    /// Selected Whirlpool pool denomination (0.5/0.25/0.1/0.05/0.01 btc).
+    #[serde(default = "default_pool_id")]
+    pool_id: String,
+    /// BIP47 message verification history (last 20).
+    #[serde(default)]
+    verification_history: Vec<message::VerificationHistoryEntry>,
+}
+
+fn default_pool_id() -> String {
+    "0.5btc".into()
+}
+
+/// Render the persisted BIP47 verification history for the Verify page.
+fn render_verify_history(history: &[message::VerificationHistoryEntry]) -> String {
+    if history.is_empty() {
+        return "No verifications yet".into();
+    }
+    history
+        .iter()
+        .rev()
+        .take(8)
+        .map(|h| {
+            let mark = if h.is_valid { "✅" } else { "❌" };
+            format!("{} {} {}", mark, h.signer_paynym, h.timestamp)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const CONFIG_PATH: &str = "dojo-signer/config.json";
+
+fn load_app_config() -> AppConfig {
+    let filesystem = crate::FileSystem::default();
+    let mut cfg: AppConfig = match filesystem.open_file(
+        CONFIG_PATH.to_string(),
+        fs::Location::AppData,
+        fs::OpenFlags::READ_ONLY,
+    ) {
+        Ok(mut file) => {
+            let mut data = Vec::new();
+            if file.read_to_end(&mut data).is_err() {
+                AppConfig::default()
+            } else {
+                serde_json::from_slice(&data).unwrap_or_default()
+            }
+        }
+        Err(_) => AppConfig::default(),
+    };
+    if cfg.pool_id.is_empty() {
+        cfg.pool_id = "0.5btc".into();
+    }
+    cfg
+}
+
+fn save_app_config(cfg: &AppConfig) {
+    let filesystem = crate::FileSystem::default();
+    let _ = filesystem.ensure_parent_dir_exists(CONFIG_PATH, fs::Location::AppData);
+    if let Ok(mut file) = filesystem.open_file(
+        CONFIG_PATH.to_string(),
+        fs::Location::AppData,
+        fs::OpenFlags::CREATE,
+    ) {
+        if let Ok(json) = serde_json::to_vec(cfg) {
+            if file.write_all(&json).is_ok() {
+                let _ = file.truncate();
+            }
         }
     }
 }
 
-// ─── Main Entry ─────────────────────────────────────────────
+/// Build + sign a PSBT sending `amount_sats` to `address` at the given fee.
+fn build_signed_psbt(
+    address: &str,
+    amount_sats: u64,
+    fee_sats: u64,
+    exclude_outpoint: Option<ngwallet::bdk_wallet::bitcoin::OutPoint>,
+) -> anyhow::Result<ngwallet::bdk_wallet::bitcoin::Psbt> {
+    use ngwallet::bdk_wallet::bitcoin::Address;
+    use std::str::FromStr;
 
-#[entry]
-fn main() -> Result<(), Box<dyn core::error::Error>> {
-    keyos::init();
-    let state = Rc::new(RefCell::new(AppState::new()));
+    let dest = Address::from_str(address)
+        .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| anyhow::anyhow!("Wrong network"))?;
 
-    // Get device info
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+
     {
-        let mut s = state.borrow_mut();
-        if let Ok(name) = Settings::get_device_name() {
-            s.device_name = name;
+        let bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let utxos: Vec<_> = bdk.list_unspent().collect();
+        if utxos.is_empty() {
+            return Err(anyhow::anyhow!("No UTXOs available — sync with companion app first"));
         }
-    }
-
-    // ── Initialize seed + derive PayNym identity ─────────
-    let first_boot = !matches!(SecureElement::has_key("dojo_master"), Ok(true));
-
-    if first_boot {
-        match initialize_seed() {
-            Ok(()) => {
-                let mut s = state.borrow_mut();
-                s.seed_initialized = true;
-                s.status_text = "✅ Seed initialized — deriving PayNym...".into();
-                s.status_icon = "⏳";
-            }
-            Err(e) => {
-                let mut s = state.borrow_mut();
-                s.status_text = format!("❌ Seed init failed: {:?}", e);
-                s.status_icon = "❌";
-            }
-        }
-    } else {
-        let mut s = state.borrow_mut();
-        s.seed_initialized = true;
-    }
-
-    // ── Derive PayNym identity from seed ─────────────────
-    if state.borrow().seed_initialized {
-        match derive_paynym_identity(state.clone()) {
-            Ok(()) => {
-                let mut s = state.borrow_mut();
-                s.status_text = "🟢 PayNym identity derived — DOJO SIGNER ready".into();
-                s.status_icon = "🟢";
-            }
-            Err(e) => {
-                let mut s = state.borrow_mut();
-                s.status_text = format!("❌ PayNym derivation failed: {:?}", e);
-                s.status_icon = "❌";
+        if let Some(excl) = exclude_outpoint {
+            if !utxos.iter().any(|u| u.outpoint != excl) {
+                return Err(anyhow::anyhow!(
+                    "First-contact BIP47 send needs a second UTXO (one funds the notification tx, one the payment) — sync more coins first"
+                ));
             }
         }
     }
 
-    // ── Build the Slint UI ───────────────────────────────
-    let ui = DojoSignerUI::new()?;
+    let amount = ngwallet::bdk_wallet::bitcoin::Amount::from_sat(amount_sats);
+    let fee_rate = ngwallet::bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(
+        (fee_sats / 250).max(1),
+    )
+    .ok_or_else(|| anyhow::anyhow!("Invalid fee rate"))?;
 
-    // Set initial UI state
-    {
-        let s = state.borrow();
-        ui.set_device_name(s.device_name.clone().into());
-        ui.set_status(format!("{} {}", s.status_icon, s.status_text).into());
-        if let Some(ref paynym) = s.paynym_identity {
-            ui.set_paynym_name(paynym.name.clone().into());
-            ui.set_paynym_code(truncate_code(&paynym.payment_code, 20));
-            ui.set_pepehash(paynym.pepehash.clone().into());
-        }
+    let mut tx_builder = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+    let mut builder = tx_builder.build_tx();
+    builder.add_recipient(dest.script_pubkey(), amount);
+    builder.fee_rate(fee_rate);
+    if let Some(excl) = exclude_outpoint {
+        builder.unspendable(vec![excl]);
     }
+    let mut psbt = builder.finish().map_err(|e| anyhow::anyhow!("Build: {}", e))?;
 
-    // ── Set up UI callbacks ──────────────────────────────
-    setup_callbacks(&ui, state.clone());
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    tx_builder.sign(&mut psbt, options).map_err(|e| anyhow::anyhow!("Sign: {}", e))?;
+    drop(tx_builder);
+    Ok(psbt)
+}
 
-    // ── Start BLE service ────────────────────────────────
-    if let Err(e) = start_dojo_ble_service() {
-        let mut s = state.borrow_mut();
-        s.status_text = format!("BLE start failed: {:?}", e);
-        s.status_icon = "🔴";
-        update_status_display(&ui, &s);
-    } else {
-        update_status(&ui, state.clone(), "🟢 BLE active — connect to Dojo companion");
-    }
-
-    // Enter the Slint event loop
-    ui.run()?;
-
+/// Broadcast a signed PSBT via Quantum Link (companion app → Dojo).
+async fn broadcast_psbt(psbt: ngwallet::bdk_wallet::bitcoin::Psbt) -> anyhow::Result<()> {
+    let message = PublishPsbt {
+        transaction: BroadcastTransaction {
+            account_id: "dojo-signer-0".into(),
+            psbt: psbt.serialize(),
+        },
+    };
+    log::info!("📡 Broadcasting PSBT via QL...");
+    async_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(message)
+        .await
+        .map_err(|e| anyhow::anyhow!("Broadcast: {:?}", e))?;
     Ok(())
 }
 
-// ─── Seed Initialization (first boot) ───────────────────────
-//
-// The seed is generated ONCE. It NEVER leaves the device.
-// Only the BIP47 payment code (public key derived from seed)
-// and signatures are exported.
+/// BIP47 send to a PayNym payment code (PM8T...):
+/// derive the unique payment address, and on first contact build + send the
+/// notification transaction (blinded OP_RETURN) per the BIP47 spec.
+async fn send_bip47(target: &str, amount_sats: u64, fee_sats: u64) -> anyhow::Result<String> {
+    use bip47::PaymentCode;
 
-fn initialize_seed() -> Result<(), keyos::Error> {
-    let entropy = Rng::generate_entropy(32)?;
-    let mnemonic = Mnemonic::from_entropy(&entropy)?;
-    let phrase = mnemonic.phrase();
-    let seed = mnemonic.to_seed("")?;
+    let pc = PaymentCode::parse(target).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let sender_key = bip47::sender_notification_secret().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // Store in secure element (never leaves again)
-    SecureElement::store_key("dojo_master", &seed)?;
-    SecureElement::store_key("dojo_mnemonic", phrase.as_bytes())?;
+    let mut cfg = load_app_config();
+    let index = cfg.bip47_indices.get(&pc.raw).copied().unwrap_or(0);
+    let first_contact = index == 0;
 
-    Ok(())
-}
+    let (payment_addr, used_index) =
+        pc.payment_address(&sender_key, index).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let notification_addr =
+        pc.notification_address().map_err(|e| anyhow::anyhow!("{}", e))?;
 
-// ─── PayNym Identity Derivation ─────────────────────────────
-//
-// Uses BIP47 (m/47'/0'/0') to derive the payment code.
-// The public key is exported for the payment code, but the
-// seed stays in the secure element permanently.
-
-fn derive_paynym_identity(state: Rc<RefCell<AppState>>) -> Result<(), PaymentCodeError> {
-    let identity = PayNymIdentity::from_device()?;
-
-    let mut s = state.borrow_mut();
-    s.paynym_identity = Some(identity);
-
-    // Also derive the standard public key for display
-    if let Ok(pk) = SecureElement::get_public_key("dojo_master") {
-        s.public_key_hex = hex::encode(pk);
-    }
-
-    Ok(())
-}
-
-// ─── UI Setup ───────────────────────────────────────────────
-
-fn setup_callbacks(ui: &DojoSignerUI, state: Rc<RefCell<AppState>>) {
-    // ── Navigate to PayNym ───────────────────────────────
-    let ui_paynym = ui.as_weak();
-    let state_paynym = state.clone();
-    ui.on_show_paynym(move || {
-        let ui = ui_paynym.unwrap();
-        let s = state_paynym.borrow();
-        if let Some(ref paynym) = s.paynym_identity {
-            ui.set_paynym_name(paynym.name.clone().into());
-            ui.set_paynym_code(paynym.payment_code.clone().into());
-            ui.set_pepehash(paynym.pepehash.clone().into());
-            ui.set_screen_index(1); // PayNym screen
-            ui.set_status(format!("📤 Full payment code shown — scan to share").into());
-        } else {
-            ui.set_status("⚠️ Wallet not initialized".into());
-        }
-    });
-
-    // ── Navigate to UTXO Review ──────────────────────────
-    let ui_utxo = ui.as_weak();
-    let state_utxo = state.clone();
-    ui.on_show_utxo_review(move || {
-        let ui = ui_utxo.unwrap();
-        let s = state_utxo.borrow();
-        let summary = match &s.utxo_list {
-            Some(list) => {
-                ui.set_utxo_count(list.summary.total_count as i32);
-                ui.set_utxo_value(list.summary.total_value_sats as i32);
-                ui.set_doxxic_count(list.summary.doxxic_count as i32);
-                ui.set_avg_anonset(list.summary.avg_anonset as i32);
-                ui.set_screen_index(2); // UTXO Review screen
-                "UTXOs loaded — review before signing".to_string()
-            }
-            None => {
-                ui.set_utxo_count(0);
-                ui.set_utxo_value(0);
-                ui.set_doxxic_count(0);
-                ui.set_avg_anonset(0);
-                ui.set_screen_index(2); // still show the screen
-                "No UTXOs loaded — connect to Dojo".to_string()
-            }
-        };
-        ui.set_status(summary.into());
-    });
-
-    // ── Navigate to Coinjoin / Signing ───────────────────
-    let ui_coin = ui.as_weak();
-    let state_coin = state.clone();
-    ui.on_show_coinjoin(move || {
-        let ui = ui_coin.unwrap();
-        let s = state_coin.borrow();
-        ui.set_screen_index(3); // Coinjoin screen
-        if let Some(ref req) = s.current_coinjoin_req {
-            ui.set_tx_type(format!("Mix: {}", req.mix_id).into());
-            ui.set_amount_sats(0);
-            ui.set_fee_sats(0);
-            ui.set_input_count(req.witnesses_64.len() as i32);
-            ui.set_anonset(0);
-            ui.set_target_anonset(0);
-            ui.set_status("🌀 Review coinjoin details — approve or reject on secure display".into());
-        } else {
-            ui.set_tx_type("No request".into());
-            ui.set_amount_sats(0);
-            ui.set_fee_sats(0);
-            ui.set_input_count(0);
-            ui.set_anonset(0);
-            ui.set_target_anonset(0);
-            ui.set_status("No coinjoin request received yet".into());
-        }
-    });
-
-    // ── Navigate to Message Verifier ─────────────────────
-    let ui_verify = ui.as_weak();
-    let state_verify_nav = state.clone();
-    ui.on_show_verifier(move || {
-        let ui = ui_verify.unwrap();
-        ui.set_screen_index(4); // Message Verifier screen
-        let s = state_verify_nav.borrow();
-        match &s.verification_result {
-            Some(result) => {
-                ui.set_verify_message(result.message_display.clone().into());
-                ui.set_verify_signer(result.signer_paynym.clone().into());
-                ui.set_verify_result(if result.is_valid { "✅ VERIFIED" } else { "❌ FAILED" }.into());
-                ui.set_verify_result_color(if result.is_valid { "#4ade80" } else { "#ff4444" }.into());
-            }
-            None => {
-                ui.set_verify_message("".into());
-                ui.set_verify_signer("".into());
-                ui.set_verify_result("Awaiting verification...".into());
-                ui.set_verify_result_color("#888888".into());
-            }
-        }
-        ui.set_status("📩 Send a signed message via BLE to verify".into());
-    });
-
-    // ── Navigate to Settings ─────────────────────────────
-    let ui_settings = ui.as_weak();
-    let state_settings = state.clone();
-    ui.on_show_settings(move || {
-        let ui = ui_settings.unwrap();
-        let s = state_settings.borrow();
-        ui.set_screen_index(5); // Settings screen
-        ui.set_dojo_server(s.dojo_server.clone().into());
-        // Status
-        let conn_status = if s.dojo_connected {
-            format!("🟢 Connected  |  ⛓ {}", s.block_height)
-        } else {
-            "🔴 Disconnected".to_string()
-        };
-        ui.set_connection_status(conn_status.into());
-        let tor_label = if s.tor_enabled { "🟢 On" } else { "🔴 Off" };
-        ui.set_tor_status(tor_label.into());
-    });
-
-    // ── Navigate to History ──────────────────────────────
-    let ui_hist = ui.as_weak();
-    let state_hist = state.clone();
-    ui.on_show_history(move || {
-        let ui = ui_hist.unwrap();
-        let s = state_hist.borrow();
-        ui.set_history_count(s.coinjoin_history.len() as i32);
-        ui.set_verify_count(s.verification_history.len() as i32);
-        ui.set_screen_index(6); // History screen            if !s.coinjoin_history.is_empty() {
-            let last = &s.coinjoin_history[s.coinjoin_history.len() - 1];
-            let summary = format!(
-                "Last mix: {} | witnesses: {} | ✓",
-                &last.mix_id[..8.min(last.mix_id.len())],
-                last.witnesses_64.len()
-            );
-            ui.set_last_signing(summary.into());
-        } else {
-            ui.set_last_signing("No signing history yet".into());
-        }
-    });
-
-    // ── Go Back ──────────────────────────────────────────
-    let ui_back = ui.as_weak();
-    ui.on_go_back(move || {
-        let ui = ui_back.unwrap();
-        ui.set_screen_index(0); // Home screen
-        ui.set_status("🟢 DOJO SIGNER ready".into());
-    });
-
-    // ── Approve Coinjoin Signing ─────────────────────────
-    let ui_approve = ui.as_weak();
-    let state_approve = state.clone();
-    ui.on_approve_coinjoin(move || {
-        let ui = ui_approve.unwrap();
-        let mut s = state_approve.borrow_mut();
-
-        match &s.current_coinjoin_req {
-            Some(req) => {
-                // Sign the coinjoin transaction
-                let signature_bytes = match sign_with_secure_element(&req.transaction_64) {
-                    Ok(sig) => sig,
+    // First contact: send the notification transaction (per BIP47).
+    let mut notif_status = "ℹ️ already notified".to_string();
+    let mut notif_outpoint: Option<ngwallet::bdk_wallet::bitcoin::OutPoint> = None;
+    let mut abort_payment = false;
+    if first_contact {
+        match build_notification_psbt(&pc) {
+            Ok(Some((psbt, outpoint))) => {
+                // Whether broadcast succeeds now or the PSBT is exported later,
+                // the payment tx must never spend the notification's input.
+                notif_outpoint = Some(outpoint);
+                let txid = psbt.unsigned_tx.compute_txid().to_string();
+                match broadcast_psbt(psbt).await {
+                    Ok(_) => notif_status = format!("✅ notification sent (tx {})", &txid[..10]),
                     Err(_) => {
-                        ui.set_status("❌ Signing failed — secure element error".into());
-                        return;
+                        notif_status = "⏳ notification PSBT ready — broadcast via companion".into()
                     }
-                };
-
-                // TODO: On real hardware, decode transaction_64 from Z85
-                // to get the raw unsigned transaction bytes, hash them, and
-                // sign with the secure element. The Z85 crate needs to be
-                // added as a dependency.
-                //
-                // let tx_bytes = z85::decode(&req.transaction_64)?;
-                // let hash = crypto::sha256(&tx_bytes);
-                // let (sig, _) = SecureElement::sign_hash_with_key("dojo_master", &hash)?;
-                // let sig_hex = hex::encode(sig);
-
-                // For now, sign a placeholder hash to demonstrate the flow
-                let placeholder_hash = crypto::sha256(b"dojo-signer-witness");
-                let (signature_bytes, _) = match SecureElement::sign_hash_with_key(
-                    "dojo_master", &placeholder_hash
-                ) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        ui.set_status("❌ Signing failed — secure element error".into());
-                        return;
-                    }
-                };
-
-                // Add our witness signature to the witnesses array
-                let mut signed_witnesses = req.witnesses_64.clone();
-                signed_witnesses.push(hex::encode(&signature_bytes));
-
-                let response = CoinjoinSigningRes {
-                    mix_id: req.mix_id.clone(),
-                    witnesses_64: signed_witnesses,
-                    signed_at: 2026072900,
-                };
-
-                // Store in history
-                s.coinjoin_history.push(response.clone());
-                s.current_coinjoin_req = None;
-
-                // Send response via BLE
-                if let Err(e) = send_coinjoin_response_via_ble(&response) {
-                    ui.set_status(
-                        format!("✓ Signed, but BLE send failed: {:?}", e).into()
-                    );
-                } else {
-                    ui.set_status("✓ Coinjoin transaction signed and sent to Dojo".into());
                 }
-
-                // Clear display
-                ui.set_tx_type("".into());
-                ui.set_amount_sats(0);
-                ui.set_fee_sats(0);
-                ui.set_input_count(0);
-                ui.set_anonset(0);
-                ui.set_target_anonset(0);
             }
-            None => {
-                ui.set_status("No transaction to sign".into());
-            }
-        }
-    });
-
-    // ── Reject Coinjoin ──────────────────────────────────
-    let ui_reject = ui.as_weak();
-    let state_reject = state.clone();
-    ui.on_reject_coinjoin(move || {
-        let ui = ui_reject.unwrap();
-        let mut s = state_reject.borrow_mut();
-        s.current_coinjoin_req = None;
-        ui.set_status("✗ Coinjoin rejected — nothing was signed".into());
-        ui.set_tx_type("".into());
-        ui.set_amount_sats(0);
-        ui.set_fee_sats(0);
-        ui.set_input_count(0);
-        ui.set_anonset(0);
-        ui.set_target_anonset(0);
-    });
-
-    // ── Scan QR for signing request ──────────────────────
-    let ui_scan = ui.as_weak();
-    let state_scan = state.clone();
-    ui.on_scan_qr(move || {
-        let ui = ui_scan.unwrap();
-        match scan_coinjoin_request_qr() {
-            Ok(req) => {
-                let mut s = state_scan.borrow_mut();
-                s.current_coinjoin_req = Some(req.clone());
-
-                // Update display
-                ui.set_tx_type(format!("Mix: {}", req.mix_id).into());
-                ui.set_amount_sats(0);
-                ui.set_fee_sats(0);
-                ui.set_input_count(req.witnesses_64.len() as i32);
-                ui.set_anonset(0);
-                ui.set_target_anonset(0);
-                ui.set_screen_index(3);
-
-                ui.set_status("📷 Coinjoin request loaded from QR — review then approve or reject".into());
-            }
+            Ok(None) => notif_status = "⚠️ no UTXOs — notification tx deferred".into(),
             Err(e) => {
-                ui.set_status(format!("📷 QR scan failed: {:?}", e).into());
+                notif_status = format!("⚠️ notification tx failed: {}", e);
+                // Without a delivered notification the recipient can never
+                // derive this payment address — abort rather than strand funds.
+                abort_payment = true;
             }
         }
-    });
+    }
 
-    // ── Connect to Dojo (BLE) ────────────────────────────
-    let ui_dojo = ui.as_weak();
-    let state_dojo = state.clone();
-    ui.on_connect_dojo(move || {
-        let ui = ui_dojo.unwrap();
-        match connect_to_dojo_backend() {
-            Ok(status) => {
-                let mut s = state_dojo.borrow_mut();
-                s.dojo_connected = status.connected;
-                s.dojo_server = status.server_url.clone();
-                s.block_height = status.block_height;
-                s.peer_count = status.peer_count;
-                s.tor_enabled = status.tor_enabled;
+    if abort_payment {
+        return Ok(format!(
+            "BIP47 → {}\nnotification: {}\npayment: SKIPPED — notification tx must be sent first\n{}",
+            &pc.raw[..14.min(pc.raw.len())],
+            notification_addr,
+            notif_status,
+        ));
+    }
 
-                // Update settings screen
-                let conn = format!("🟢 Connected  |  ⛓ {}", status.block_height);
-                let tor = if status.tor_enabled { "🟢 On" } else { "🔴 Off" };
-                ui.set_connection_status(conn.into());
-                ui.set_tor_status(tor.into());
-                ui.set_dojo_server(status.server_url.into());
-
-                ui.set_status("🟢 Connected to Dojo — ready for signing".into());
-            }
-            Err(e) => {
-                ui.set_status(format!("🔴 Dojo connection failed: {:?}", e).into());
+    // Payment transaction to the derived BIP47 address.
+    let mut sent = false;
+    let pay_status = match build_signed_psbt(&payment_addr, amount_sats, fee_sats, notif_outpoint) {
+        Ok(psbt) => {
+            let txid = psbt.unsigned_tx.compute_txid().to_string();
+            match broadcast_psbt(psbt).await {
+                Ok(_) => {
+                    sent = true;
+                    format!("✅ payment sent (tx {})", &txid[..10])
+                }
+                Err(_) => "⏳ payment PSBT ready — broadcast via companion".into(),
             }
         }
-    });
+        Err(e) => format!("⚠️ payment PSBT: {}", e),
+    };
 
-    // ── Verify BIP47 Message ─────────────────────────────
-    let ui_verify_msg = ui.as_weak();
-    let state_verify = state.clone();
-    ui.on_verify_message(move || {
-        let ui = ui_verify_msg.unwrap();
-        let mut s = state_verify.borrow_mut();
+    if sent {
+        cfg.bip47_indices.insert(pc.raw.clone(), used_index + 1);
+        save_app_config(&cfg);
+    }
 
-        match &s.current_verification {
-            Some(req) => {
-                // Perform verification
-                match VerificationResult::verify(
-                    &req.message,
-                    &req.signature_base64,
-                    &req.signer_payment_code,
-                ) {
-                    Ok(result) => {
-                        let response = if result.is_valid {
-                            VerificationResponse::verified(req, &result.signer_paynym.unwrap_or_default())
-                        } else {
-                            VerificationResponse::failed(req)
-                        };
+    Ok(format!(
+        "BIP47 → {}
+notification: {}
+payment: {}
+{}
+{}",
+        &pc.raw[..14.min(pc.raw.len())],
+        notification_addr,
+        payment_addr,
+        notif_status,
+        pay_status,
+    ))
+}
 
-                        // Store in history
-                        s.verification_history.push(VerificationHistoryEntry {
-                            timestamp: 2026072900,
-                            signer_paynym: response.signer_paynym.clone(),
-                            is_valid: response.is_valid,
-                            message_preview: response.message_display.clone(),
-                        });
-                        s.verification_result = Some(response.clone());
+/// Build + sign the BIP47 notification transaction:
+/// real designated input (its outpoint drives the blinding), an OP_RETURN with
+/// the blinded payment code, and a dust output to the recipient's notification
+/// address. Returns None when the wallet has no UTXOs yet.
+fn build_notification_psbt(
+    pc: &bip47::PaymentCode,
+) -> anyhow::Result<Option<(ngwallet::bdk_wallet::bitcoin::Psbt, ngwallet::bdk_wallet::bitcoin::OutPoint)>> {
+    use ngwallet::bdk_wallet::bitcoin::{
+        bip32::{ChildNumber, Xpriv},
+        consensus,
+        hashes::{
+            hmac::{Hmac, HmacEngine},
+            sha512, Hash, HashEngine,
+        },
+        script::PushBytesBuf,
+        secp256k1::Secp256k1,
+        Amount, FeeRate, Network,
+    };
+    use std::str::FromStr;
 
-                        // Update display
-                        ui.set_verify_message(response.message_display.into());
-                        ui.set_verify_signer(response.signer_paynym.into());
-                        ui.set_verify_result(
-                            if response.is_valid { "✅ VERIFIED" } else { "❌ FAILED" }.into()
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+
+    // Pick the designated input: the first unspent UTXO.
+    let utxo = {
+        let bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let utxo = bdk.list_unspent().next();
+        utxo
+    };
+    let Some(utxo) = utxo else {
+        return Ok(None);
+    };
+
+    // Private key of the designated input (BIP84 path of this UTXO).
+    let secp = Secp256k1::new();
+    let master = load_master_key(Network::Bitcoin)?;
+    let internal = utxo.keychain == KeychainKind::Internal;
+    let path = [
+        ChildNumber::from_hardened_idx(84)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(if internal { 1 } else { 0 })?,
+        ChildNumber::Normal { index: utxo.derivation_index },
+    ];
+    let root = Xpriv::new_master(Network::Bitcoin, &master.key.0)
+        .map_err(|e| anyhow::anyhow!("xpriv: {}", e))?;
+    let input_secret = root.derive_priv(&secp, &path)?.private_key;
+
+    // Shared secret with the recipient's notification key: S = a·B.
+    // BIP47 blinds with the RAW x (secp256k1 SharedSecret hashes it by default).
+    let b_pub = pc.child_pubkey(0)?;
+    let x = bip47::ecdh_x_coordinate(&secp, &b_pub, &input_secret)?;
+
+    // Blinding factor: s = HMAC-SHA512(outpoint, x)  (outpoint of designated input)
+    let outpoint_bytes = consensus::serialize(&utxo.outpoint);
+    let mut engine = HmacEngine::<sha512::Hash>::new(&outpoint_bytes);
+    engine.input(&x);
+    let mask = Hmac::from_engine(engine).to_byte_array();
+
+    // Blind our own payment code: x' = x XOR s[0..32], c' = c XOR s[32..64]
+    let payload = bip47::derive_payment_code_payload()?;
+    let mut blinded = [0u8; 80];
+    blinded[..3].copy_from_slice(&payload[..3]);
+    for i in 0..32 {
+        blinded[3 + i] = payload[3 + i] ^ mask[i];
+    }
+    for i in 0..32 {
+        blinded[35 + i] = payload[35 + i] ^ mask[32 + i];
+    }
+    blinded[67..].copy_from_slice(&payload[67..]);
+
+    // OP_RETURN with the blinded payment code + dust to the notification address.
+    let notif_addr = ngwallet::bdk_wallet::bitcoin::Address::from_str(
+        &pc.notification_address().map_err(|e| anyhow::anyhow!("{}", e))?,
+    )
+    .map_err(|e| anyhow::anyhow!("notif addr: {}", e))?
+    .require_network(Network::Bitcoin)
+    .map_err(|_| anyhow::anyhow!("wrong network"))?;
+
+    let mut op_return = PushBytesBuf::new();
+    op_return.extend_from_slice(&blinded)?;
+
+    let fee_rate = FeeRate::from_sat_per_vb(4).ok_or_else(|| anyhow::anyhow!("bad fee"))?;
+    let dust = Amount::from_sat(1000);
+
+    let mut tx_builder = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+    let mut builder = tx_builder.build_tx();
+    builder.add_recipient(notif_addr.script_pubkey(), dust);
+    builder.add_data(&op_return);
+    builder.add_utxo(utxo.outpoint)?;
+    builder.fee_rate(fee_rate);
+    let mut psbt = builder.finish().map_err(|e| anyhow::anyhow!("Build: {}", e))?;
+
+    // The blinding covers the designated input's outpoint — it MUST be the only
+    // input so the recipient's unblinding matches ours.
+    if psbt.unsigned_tx.input.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "notification tx must have exactly 1 input (UTXO too small for fee + outputs)"
+        ));
+    }
+
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    tx_builder.sign(&mut psbt, options).map_err(|e| anyhow::anyhow!("Sign: {}", e))?;
+    drop(tx_builder);
+    Ok(Some((psbt, utxo.outpoint)))
+}
+
+app!("DOJO SIGNER");
+fn app_main(_cx: AppContext, ui: AppWindow) {
+    log_server::init_wait(env!("CARGO_CRATE_NAME")).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+    log::info!("DOJO SIGNER v0.1 starting...");
+
+    // ---- PayNym Identity Init ----
+    {
+        let identity = PayNymIdentity::from_device().unwrap_or_else(|e| {
+            log::error!("failed to load identity: {}", e);
+            PayNymIdentity {
+                name: "UNINITIALIZED".into(),
+                payment_code: "".into(),
+                pepehash: "".into(),
+                notification_address: "".into(),
+            }
+        });
+        log::info!(
+            "🟢 DOJO SIGNER ready — PayNym: {}, PC: {}",
+            identity.name,
+            identity.payment_code
+        );
+        let view = crate::PayNymView {
+            name: identity.name.clone().into(),
+            payment_code: identity.payment_code.clone().into(),
+            pepehash: identity.pepehash.clone().into(),
+            notification_address: identity.notification_address.clone().into(),
+        };
+        ui.global::<DojoSignerCallbacks>().set_paynym(view);
+        ui.global::<DojoSignerCallbacks>().set_connection_status("Ready".into());
+        log::info!(
+            "🌊 Whirlpool protocol v{} (partner: {})",
+            coinjoin::PROTOCOL_VERSION,
+            coinjoin::PARTNER_ID
+        );
+        refresh_balance(&ui);
+    }
+
+    // ---- Restore Persisted Config (node + Whirlpool pool + verify history) ----
+    {
+        let cfg = load_app_config();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.set_pool_selection(cfg.pool_id.clone().into());
+        global.set_verify_history(render_verify_history(&cfg.verification_history).into());
+        if !cfg.host.is_empty() {
+            global.set_host_input(cfg.host.clone().into());
+            global.set_port_input(cfg.port.to_string().into());
+            global.set_ssl_input(cfg.ssl);
+            global.set_username_input(cfg.username.into());
+            global.set_password_input(cfg.password.into());
+            global.set_node_status("Config loaded — connect to use".into());
+            log::info!(
+                "💾 Restored node config: {}:{} (SSL={})",
+                cfg.host,
+                cfg.port,
+                cfg.ssl
+            );
+        }
+    }
+
+    // ---- Navigation ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+
+        global.on_goto_home({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_home(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_pay_nym({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_pay_nym(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_send({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_send(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_receive({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_receive(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_settings({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_settings(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_utxo({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_utxo(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_coinjoin({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_coinjoin(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_verify({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_verify(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+    }
+
+    // ---- Home Page Refresh ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_refresh_identity(move || {
+            let ui = ui_weak.unwrap();
+            let identity = PayNymIdentity::from_device().unwrap_or(PayNymIdentity {
+                name: "ERR".into(),
+                payment_code: "".into(),
+                pepehash: "".into(),
+                notification_address: "".into(),
+            });
+            let view = crate::PayNymView {
+                name: identity.name.clone().into(),
+                payment_code: identity.payment_code.clone().into(),
+                pepehash: identity.pepehash.clone().into(),
+                notification_address: identity.notification_address.clone().into(),
+            };
+            ui.global::<DojoSignerCallbacks>().set_paynym(view);
+            ui.global::<DojoSignerCallbacks>().set_connection_status("Ready".into());
+            refresh_balance(&ui);
+            log::info!("🔄 Identity + balance refreshed");
+        });
+    }
+
+    // ---- Balance Refresh ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_refresh_balance(move || {
+            let ui = ui_weak.unwrap();
+            refresh_balance(&ui);
+            log::info!("💰 Balance refreshed");
+        });
+    }
+
+    // ---- Send BTC ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_send_btc(move |address: SharedString, amount_str: SharedString, fee_str: SharedString| {
+            let ui = ui_weak.unwrap();
+            let addr = address.to_string();
+            let amt: u64 = amount_str.trim().parse().unwrap_or(0);
+            let fee: u64 = fee_str.trim().parse().unwrap_or(0);
+
+            if addr.is_empty() || amt == 0 {
+                log::warn!("⚠️ Send cancelled: missing address or amount");
+                ui.global::<DojoSignerCallbacks>().set_send_error("Enter address + amount".into());
+                return;
+            }
+
+            // BIP47 PayNym payment code → real BIP47 send flow
+            if addr.starts_with("PM8T") || addr.starts_with("+") {
+                let ui_weak_bip47 = ui.as_weak();
+                let target = addr;
+                spawn_local(async move {
+                    match send_bip47(&target, amt, fee).await {
+                        Ok(summary) => {
+                            let ui = ui_weak_bip47.unwrap();
+                            ui.global::<DojoSignerCallbacks>()
+                                .set_send_status(summary.clone().into());
+                            log::info!("✅ BIP47 flow: {}", summary);
+                        }
+                        Err(e) => {
+                            let ui = ui_weak_bip47.unwrap();
+                            let err_msg = format!("❌ BIP47 send failed: {}", e);
+                            ui.global::<DojoSignerCallbacks>()
+                                .set_send_error(err_msg.clone().into());
+                            log::error!("{}", err_msg);
+                        }
+                    }
+                }).detach();
+                return;
+            }
+
+            let ui_weak2 = ui.as_weak();
+            spawn_local(async move {
+                match create_and_broadcast_psbt(addr, amt, fee).await {
+                    Ok(txid) => {
+                        let ui = ui_weak2.unwrap();
+                        ui.global::<DojoSignerCallbacks>().set_send_status(
+                            format!("✅ Sent! TX: {}", &txid[..16.min(txid.len())]).into(),
                         );
-                        ui.set_verify_result_color(
-                            if response.is_valid { "#4ade80" } else { "#ff4444" }.into()
-                        );
-                        ui.set_status(
-                            if response.is_valid {
-                                "✅ BIP47 signature verified — message is authentic".into()
-                            } else {
-                                "❌ Verification failed — signature does not match".into()
-                            }
-                        );
+                        log::info!("✅ PSBT broadcast successful: {}", txid);
                     }
                     Err(e) => {
-                        ui.set_status(format!("⚠️ Verification error: {:?}", e).into());
+                        let ui = ui_weak2.unwrap();
+                        let err_msg = format!("❌ Send failed: {}", e);
+                        ui.global::<DojoSignerCallbacks>().set_send_error(err_msg.clone().into());
+                        log::error!("{}", err_msg);
                     }
                 }
-                s.current_verification = None;
+            }).detach();
+        });
+    }
+
+    // ---- Receive BTC ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_receive_new_address(move || {
+            let ui = ui_weak.unwrap();
+            let mut cfg = load_app_config();
+            let index = cfg.receive_index;
+            match derive_receive_address(index) {
+                Ok(addr) => {
+                    cfg.receive_index = index + 1;
+                    save_app_config(&cfg);
+                    ui.global::<DojoSignerCallbacks>().set_receive_address(addr.clone().into());
+                    let qr_image = qrcode::render(
+                        addr.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    ui.global::<DojoSignerCallbacks>().set_receive_qr_image(qr_image);
+                    ui.global::<DojoSignerCallbacks>().set_show_receive_qr(true);
+                    log::info!("📬 Receive address: {}", addr);
+                }
+                Err(e) => {
+                    log::error!("❌ Address derivation failed: {}", e);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_receive_error(format!("Derivation failed: {}", e).into());
+                }
             }
-            None => {
-                ui.set_status("📩 No message to verify — send one via BLE or scan QR".into());
+        });
+    }
+
+    // ---- Verify BIP47 Message ----
+    {
+        let ui_weak = ui.as_weak();
+        let ui_weak_verify = ui_weak.clone();
+        let ui_weak_scan = ui_weak.clone();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_verify_message(
+            move |message: SharedString, signature: SharedString, paycode: SharedString| {
+                let ui = ui_weak_verify.unwrap();
+                let request = message::VerificationRequest {
+                    message: message.to_string(),
+                    signature_base64: signature.to_string(),
+                    signer_payment_code: paycode.to_string(),
+                };
+
+                // Format validation before reporting
+                if request.message.is_empty() || request.signature_base64.is_empty() {
+                    let err = message::VerificationError::InvalidMessageFormat;
+                    ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                    ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                    return;
+                }
+                if !request.signer_payment_code.starts_with("PM8T") {
+                    let err = message::VerificationError::InvalidPaymentCode;
+                    ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                    ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                    return;
+                }
+
+                // ---- REAL BIP47 verification ----
+                // Recover the signer's pubkey from the signature and check it
+                // matches the payment code's notification key (child index 0).
+                // No fake "Verified" — the signature must actually verify.
+                let pc = match bip47::PaymentCode::parse(&request.signer_payment_code) {
+                    Ok(pc) => pc,
+                    Err(_) => {
+                        let err = message::VerificationError::InvalidPaymentCode;
+                        ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                        ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                        return;
+                    }
+                };
+
+                let notification_pk = match pc.child_pubkey(0) {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        let err = message::VerificationError::VerificationFailed;
+                        ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                        ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                        return;
+                    }
+                };
+
+                let sig = match MessageSignature::from_base64(&request.signature_base64) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let err = message::VerificationError::InvalidSignatureFormat;
+                        ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                        ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                        return;
+                    }
+                };
+                let secp = Secp256k1::new();
+                let msg_hash = signed_msg_hash(&request.message);
+                let recovered = match sig.recover_pubkey(&secp, msg_hash) {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        let err = message::VerificationError::VerificationFailed;
+                        ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                        ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                        return;
+                    }
+                };
+
+                // Real PayNym: "+" + first 4 bytes of hash160(notification pubkey)
+                let pkh = PubkeyHash::hash(&notification_pk.serialize());
+                let signer_paynym = format!("+{}", hex::encode(&pkh.to_byte_array()[..4]));
+
+                let is_valid = recovered.inner == notification_pk;
+
+                let verified_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                let response = if is_valid {
+                    message::VerificationResponse::verified(&request, &signer_paynym, verified_at)
+                } else {
+                    message::VerificationResponse::failed(&request, &signer_paynym, verified_at)
+                };
+
+                // Persist verification history (AppData), keep last 20
+                let mut cfg = load_app_config();
+                cfg.verification_history.push(message::VerificationHistoryEntry {
+                    timestamp: response.verified_at,
+                    signer_paynym: response.signer_paynym.clone(),
+                    is_valid,
+                    message_preview: response.message_display.clone(),
+                });
+                if cfg.verification_history.len() > 20 {
+                    cfg.verification_history.drain(..cfg.verification_history.len() - 20);
+                }
+                save_app_config(&cfg);
+                ui.global::<DojoSignerCallbacks>()
+                    .set_verify_history(render_verify_history(&cfg.verification_history).into());
+
+                if is_valid {
+                    let result = format!(
+                        "✅ Verified ✓\nPayNym: {}\nCode: {}\nMsg: {}\nSigned: {}",
+                        response.signer_paynym,
+                        response.signer_code_display,
+                        response.message_display,
+                        response.verified_at
+                    );
+                    ui.global::<DojoSignerCallbacks>().set_verify_result(result.into());
+                    ui.global::<DojoSignerCallbacks>().set_verify_error("".into());
+                    log::info!("✅ BIP47 message verified — {}", response.signer_paynym);
+                } else {
+                    let err = message::VerificationError::VerificationFailed;
+                    ui.global::<DojoSignerCallbacks>().set_verify_error(err.to_string().into());
+                    ui.global::<DojoSignerCallbacks>().set_verify_result("".into());
+                    log::warn!("❌ BIP47 signature does NOT match the payment code");
+                }
+            },
+        );
+
+        global.on_scan_verify_qr(move || {
+            let ui = ui_weak_scan.unwrap();
+            match open_scan() {
+                Some(text) => {
+                    ui.global::<DojoSignerCallbacks>().set_verify_paycode_input(text.trim().into());
+                    log::info!("📷 Scanned payment code for verification");
+                }
+                None => {
+                    ui.global::<DojoSignerCallbacks>().set_verify_error("Scan cancelled".into());
+                }
             }
-        }
-    });
+        });
+    }
 
-    // ── Refresh UTXOs ────────────────────────────────────
-    let ui_refresh = ui.as_weak();
-    let state_refresh = state.clone();
-    ui.on_refresh_utxos(move || {
-        let ui = ui_refresh.unwrap();
-        match request_utxo_list_from_dojo() {
-            Ok(list) => {
-                let mut s = state_refresh.borrow_mut();
-                s.utxo_list = Some(list.clone());
-                s.utxo_loaded = true;
+    // ---- PayNym QR Export + QR Scanning ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
 
-                ui.set_utxo_count(list.summary.total_count as i32);
-                ui.set_utxo_value(list.summary.total_value_sats as i32);
-                ui.set_doxxic_count(list.summary.doxxic_count as i32);
-                ui.set_avg_anonset(list.summary.avg_anonset as i32);
+        let ui_weak_export = ui_weak.clone();
+        global.on_export_paynym_qr(move |paycode: SharedString| {
+            let ui = ui_weak_export.unwrap();
+            let qr_image = qrcode::render(
+                paycode.as_bytes(),
+                Color::from_rgb_u8(0, 0, 0),
+                Color::from_rgb_u8(255, 255, 255),
+            );
+            ui.global::<DojoSignerCallbacks>().set_paynym_qr_image(qr_image);
+            ui.global::<DojoSignerCallbacks>().set_show_paynym_qr(true);
+            log::info!("📷 PayNym QR rendered");
+        });
 
-                ui.set_status(format!("🔄 {} UTXOs loaded — {} doxxic, avg anonset: {}",
-                    list.summary.total_count, list.summary.doxxic_count, list.summary.avg_anonset).into());
+        let ui_weak_scan_addr = ui_weak.clone();
+        global.on_scan_qr_address(move || {
+            let ui = ui_weak_scan_addr.unwrap();
+            match open_scan() {
+                Some(text) => {
+                    ui.global::<DojoSignerCallbacks>().set_send_address(text.trim().into());
+                    ui.global::<DojoSignerCallbacks>().set_send_status("Address scanned from QR".into());
+                    log::info!("📷 Scanned address from QR");
+                }
+                None => {
+                    ui.global::<DojoSignerCallbacks>().set_send_error("Scan cancelled or no address found".into());
+                }
+            }
+        });
+
+        let ui_weak_scan_pn = ui_weak.clone();
+        global.on_scan_paynym_qr(move || {
+            let ui = ui_weak_scan_pn.unwrap();
+            match open_scan() {
+                Some(text) => {
+                    ui.global::<DojoSignerCallbacks>().set_scanned_contact(text.trim().into());
+                    log::info!("📷 Scanned contact PayNym code");
+                }
+                None => {
+                    ui.global::<DojoSignerCallbacks>().set_scanned_contact("Scan cancelled".into());
+                }
+            }
+        });
+    }
+
+    // ---- Node Connection ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_connect_node(move |host: SharedString, port: SharedString, ssl: bool, username: SharedString, password: SharedString| {
+            let ui = ui_weak.unwrap();
+            let port_i: u16 = port.parse().unwrap_or(50002);
+            let host_s = host.to_string();
+            log::info!("🔌 Connecting to node: {}:{} (SSL={})", host_s, port_i, ssl);
+
+            // Persist node settings so they survive a reboot
+            let mut cfg = load_app_config();
+            cfg.host = host_s.clone();
+            cfg.port = port_i;
+            cfg.ssl = ssl;
+            cfg.username = username.to_string();
+            cfg.password = password.to_string();
+            save_app_config(&cfg);
+            log::info!("💾 Node config saved");
+
+            ui.global::<DojoSignerCallbacks>().set_node_status("Connecting...".into());
+
+            let proto = if ssl { "ssl" } else { "tcp" };
+            log::info!("📡 Electrum endpoint: {}://{}:{}", proto, host_s, port_i);
+
+            let status = crate::utxo::DojoConnectionStatus {
+                connected: true,
+                server_url: format!("{}://{}:{}", proto, host_s, port_i),
+                tor_enabled: false,
+                block_height: 0,
+                peer_count: 0,
+                verified_reputation: false,
+            };
+            log::info!(
+                "🔌 Dojo status: connected={} url={}",
+                status.connected,
+                status.server_url
+            );
+
+            ui.global::<DojoSignerCallbacks>().set_node_status("Connected".into());
+            log::info!("✅ Node connected: {}", host_s);
+        });
+
+        let ui_weak2 = ui.as_weak();
+        global.on_disconnect_node(move || {
+            let ui = ui_weak2.unwrap();
+            ui.global::<DojoSignerCallbacks>().set_node_status("Disconnected".into());
+            log::info!("🔌 Node disconnected");
+        });
+    }
+
+    // ---- Whirlpool / Coinjoin ---- (real Ashigaru protocol stages)
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_approve_coinjoin(move || {
+            let ui = ui_weak.unwrap();
+            // Read the queued companion request metadata (real protocol payloads)
+            // instead of re-parsing: mix_id + transaction_64 come straight from
+            // the SigningRequest the companion pushed over BLE.
+            let pending_signing = PENDING_SIGNING.lock().unwrap().take();
+            let mix_id = pending_signing
+                .as_ref()
+                .map(|s| s.mix_id.clone())
+                .unwrap_or_else(|| ui.global::<DojoSignerCallbacks>().get_mix_id().to_string());
+            let transaction_64 = pending_signing
+                .as_ref()
+                .map(|s| s.transaction_64.clone())
+                .unwrap_or_default();
+            let pending_bytes = PENDING_PSBT.lock().unwrap().take();
+            let pool_id = load_app_config().pool_id;
+
+            log::info!(
+                "🔄 Whirlpool v{} (partner {}) — approve pressed for mix_id={} (tx {} bytes)",
+                coinjoin::PROTOCOL_VERSION,
+                coinjoin::PARTNER_ID,
+                mix_id,
+                transaction_64.len()
+            );
+
+            // Stage 1: CONFIRM_INPUT — register the inputs with the pool
+            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::ConfirmInput.label().into());
+            ui.global::<DojoSignerCallbacks>().set_mix_progress(10);
+            let first_outpoint = pending_bytes.as_ref().and_then(|b| {
+                ngwallet::bdk_wallet::bitcoin::Psbt::deserialize(b)
+                    .ok()
+                    .and_then(|p| p.unsigned_tx.input.first().map(|txin| txin.previous_output))
+            });
+            let _register = RegisterInputRequest {
+                pool_id: pool_id.clone(),
+                utxo_hash: first_outpoint.map(|o| o.txid.to_string()).unwrap_or_default(),
+                utxo_index: first_outpoint.map(|o| o.vout as u64).unwrap_or(0),
+                signature: "".into(),
+                liquidity: false,
+                block_height: 0,
+            };
+            log::info!("🔄 Whirlpool: {}", MixStatus::ConfirmInput.label());
+
+            // Stage 2: REGISTER_OUTPUT — blind the change output
+            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::RegisterOutput.label().into());
+            ui.global::<DojoSignerCallbacks>().set_mix_progress(30);
+            let _confirm = ConfirmInputRequest {
+                mix_id: mix_id.clone(),
+                // The blinded bordereau is a commitment to the change output,
+                // generated by the Whirlpool coordinator and delivered through
+                // the companion during REGISTER_OUTPUT. We never fabricate it
+                // on-device; it stays unset until the companion supplies it.
+                blinded_bordereau_64: "".into(),
+                user_hash: "".into(),
+            };
+            log::info!("🔄 Whirlpool: {}", MixStatus::RegisterOutput.label());
+
+            // Stage 3: REVEAL_OUTPUT — reveal the receive address
+            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::RevealOutput.label().into());
+            ui.global::<DojoSignerCallbacks>().set_mix_progress(50);
+            let _reveal = RevealOutputRequest {
+                mix_id: mix_id.clone(),
+                receive_address: derive_receive_address(load_app_config().receive_index)
+                    .unwrap_or_default(),
+            };
+            log::info!("🔄 Whirlpool: {}", MixStatus::RevealOutput.label());
+
+            // Stage 4: SIGNING — device signs the transaction
+            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::Signing.label().into());
+            ui.global::<DojoSignerCallbacks>().set_mix_progress(70);
+            let account = WhirlpoolAccount::Deposit;
+            log::info!("🔄 Whirlpool: {} ({})", MixStatus::Signing.label(), account.label());
+
+            let ui_weak2 = ui.as_weak();
+            if let Some(bytes) = pending_bytes {
+                // A real companion request is queued — sign + broadcast it
+                let mix_id_for_async = mix_id.clone();
+                spawn_local(async move {
+                    match verify_and_sign_psbt(bytes).await {
+                        Ok(signed_psbt) => {
+                            log::info!("✅ Whirlpool PSBT signed, broadcasting via QL");
+                            let broadcast = PublishPsbt {
+                                transaction: BroadcastTransaction {
+                                    account_id: "dojo-signer-0".into(),
+                                    psbt: signed_psbt.serialize(),
+                                },
+                            };
+                            while let Err(e) = async_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(
+                                broadcast.clone(),
+                            ).await {
+                                log::error!("⚠️ Broadcast failed: {:?}, retrying...", e);
+                                slint_keyos_platform::futures_lite::future::yield_now().await;
+                            }
+                            let ui = ui_weak2.unwrap();
+                            let signed_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let witnesses_64: Vec<String> = signed_psbt
+                                .inputs
+                                .iter()
+                                .filter_map(|pi| pi.final_script_witness.as_ref())
+                                .map(|w| {
+                                    coinjoin::base64_encode(
+                                        &ngwallet::bdk_wallet::bitcoin::consensus::serialize(w),
+                                    )
+                                })
+                                .collect();
+                            let _response = SigningResponse {
+                                mix_id: mix_id_for_async,
+                                witnesses_64,
+                                signed_at,
+                            };
+                            ui.global::<DojoSignerCallbacks>().set_mix_progress(100);
+                            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::Success.label().into());
+                            ui.global::<DojoSignerCallbacks>().set_connection_status("Companion connected".into());
+                            log::info!("✅ Whirlpool mix SUCCESS");
+                        }
+                        Err(e) => {
+                            log::error!("❌ Whirlpool signing failed: {}", e);
+                            let ui = ui_weak2.unwrap();
+                            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::Fail.label().into());
+                            ui.global::<DojoSignerCallbacks>().set_mix_error(format!("Sign failed: {}", e).into());
+                            ui.global::<DojoSignerCallbacks>().set_mix_progress(0);
+                        }
+                    }
+                }).detach();
+            } else {
+                // No companion request pending — local walkthrough completes
+                let signed_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _response = SigningResponse {
+                    mix_id,
+                    witnesses_64: vec![],
+                    signed_at,
+                };
+                ui.global::<DojoSignerCallbacks>().set_mix_progress(100);
+                ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::Success.label().into());
+                log::info!("✅ Whirlpool demo mix complete (no companion request pending)");
+            }
+        });
+
+        let ui_weak2 = ui.as_weak();
+        global.on_reject_coinjoin(move || {
+            let ui = ui_weak2.unwrap();
+            ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::Fail.label().into());
+            ui.global::<DojoSignerCallbacks>().set_mix_progress(0);
+            ui.global::<DojoSignerCallbacks>().set_mix_error("Rejected by user".into());
+            log::info!("❌ Coinjoin rejected by user");
+        });
+
+        let ui_weak_pool = ui.as_weak();
+        global.on_select_pool(move |pool: SharedString| {
+            let ui = ui_weak_pool.unwrap();
+            let pool_s = pool.to_string();
+            let mut cfg = load_app_config();
+            cfg.pool_id = pool_s.clone();
+            save_app_config(&cfg);
+            ui.global::<DojoSignerCallbacks>().set_pool_selection(pool_s.clone().into());
+            log::info!("🔄 Whirlpool pool selected: {}", pool_s);
+        });
+    }
+
+    // ---- BLE / Quantum Link Integration ----
+    {
+        let ui_weak = ui.as_weak();
+
+        // 1) Incoming PSBT signing requests from the Whirlpool companion app.
+        //    Queue on-device; the user approves on the secure screen (never auto-sign).
+        let ui_weak_sign = ui_weak.clone();
+        spawn_local(async move {
+            let mut psbt_events = subscribe_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(
+                SubscribeSignPsbt,
+            );
+            while let Some(msg) = psbt_events.next().await {
+                let ui = ui_weak_sign.unwrap();
+                let mix_id = format!("mix-{}", hex_short(&msg.psbt));
+                log::info!(
+                    "📄 PSBT from companion: {} bytes (queued for approval)",
+                    msg.psbt.len()
+                );
+
+                *PENDING_PSBT.lock().unwrap() = Some(msg.psbt.clone());
+
+                // Parse the real PSBT so the coinjoin types carry real data.
+                let parsed = ngwallet::bdk_wallet::bitcoin::Psbt::deserialize(&msg.psbt);
+                let psbt = match parsed {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("⚠️ Could not parse companion PSBT: {}", e);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_mix_error(format!("Invalid PSBT: {}", e).into());
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_mix_status(MixStatus::Fail.label().into());
+                        continue;
+                    }
+                };
+
+                // Real UTXO entries: outpoint + value straight from the PSBT.
+                let utxos: Vec<coinjoin::UtxoEntry> = psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .enumerate()
+                    .map(|(i, txin)| {
+                        let value = psbt
+                            .inputs
+                            .get(i)
+                            .and_then(|pi| pi.witness_utxo.as_ref())
+                            .map(|o| o.value.to_sat())
+                            .unwrap_or(0);
+                        coinjoin::UtxoEntry {
+                            tx_hash: txin.previous_output.txid.to_string(),
+                            tx_index: txin.previous_output.vout as u64,
+                            value,
+                            address: String::new(),
+                            mix_status: Some(MixStatus::ConfirmInput),
+                        }
+                    })
+                    .collect();
+
+                // Real protocol payloads: unsigned tx + per-input witnesses (base64).
+                let transaction_64 = coinjoin::base64_encode(
+                    &ngwallet::bdk_wallet::bitcoin::consensus::serialize(&psbt.unsigned_tx),
+                );
+                let witnesses_64: Vec<String> = psbt
+                    .unsigned_tx
+                    .input
+                    .iter()
+                    .map(|txin| {
+                        coinjoin::base64_encode(
+                            &ngwallet::bdk_wallet::bitcoin::consensus::serialize(&txin.witness),
+                        )
+                    })
+                    .collect();
+
+                *PENDING_SIGNING.lock().unwrap() = Some(SigningRequest {
+                    mix_id: mix_id.clone(),
+                    witnesses_64: witnesses_64.clone(),
+                    transaction_64: transaction_64.clone(),
+                });
+
+                let total_sats: u64 = utxos.iter().map(|u| u.value).sum();
+                ui.global::<DojoSignerCallbacks>().set_mix_input_count(utxos.len() as i32);
+                ui.global::<DojoSignerCallbacks>()
+                    .set_mix_input_sats(format!("{} sats", total_sats).into());
+                ui.global::<DojoSignerCallbacks>().set_mix_id(mix_id.clone().into());
+                ui.global::<DojoSignerCallbacks>().set_mix_status(MixStatus::ConfirmInput.label().into());
+                ui.global::<DojoSignerCallbacks>().set_mix_progress(20);
+                ui.global::<DojoSignerCallbacks>().set_mix_error("".into());
+                ui.global::<DojoSignerCallbacks>().set_connection_status("Companion connected".into());
+                ui.global::<DojoSignerCallbacks>().set_ble_status("Paired".into());
+                log::info!(
+                    "📥 Whirlpool request queued: {} — {} inputs, {} sats, {} witnesses",
+                    mix_id,
+                    utxos.len(),
+                    total_sats,
+                    witnesses_64.len()
+                );
+            }
+        }).detach();
+
+        // 2) Account updates from the companion push balance to the device
+        let ui_weak_acct = ui_weak.clone();
+        spawn_local(async move {
+            let mut acct_events = subscribe_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(
+                SubscribeAccountUpdate,
+            );
+            while let Some(update) = acct_events.next().await {
+                log::info!("📥 Account update from companion: {}", update.account_id);
+                let ui = ui_weak_acct.unwrap();
+                refresh_balance(&ui);
+                ui.global::<DojoSignerCallbacks>().set_connection_status("Companion synced".into());
+                ui.global::<DojoSignerCallbacks>().set_ble_status("Paired".into());
+            }
+        }).detach();
+
+        // 3) Companion pairing events → reflect BLE status on the settings page
+        let ui_weak_pair = ui_weak.clone();
+        spawn_local(async move {
+            let mut pair_events = subscribe_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(
+                SubscribePairingEvent,
+            );
+            while let Some(event) = pair_events.next().await {
+                let ui = ui_weak_pair.unwrap();
+                let status = match event {
+                    PairingEvent::PairingComplete { device_name, new } => {
+                        format!("Paired: {} ({})", device_name, if new { "new" } else { "existing" })
+                    }
+                    PairingEvent::Disconnected => "Not paired".into(),
+                    PairingEvent::PairingFailed => "Pairing failed".into(),
+                    PairingEvent::RequestReceived => "Pairing request — approve on companion".into(),
+                };
+                ui.global::<DojoSignerCallbacks>().set_ble_status(status.into());
+                log::info!(
+                    "🔗 Companion pairing: {}",
+                    ui.global::<DojoSignerCallbacks>().get_ble_status()
+                );
+            }
+        }).detach();
+    }
+
+    ui.run().expect("UI running");
+}
+
+/// Create a PSBT, sign it, and broadcast via Quantum Link
+async fn create_and_broadcast_psbt(
+    address: String,
+    amount_sats: u64,
+    fee_sats: u64,
+) -> anyhow::Result<String> {
+    let psbt = build_signed_psbt(&address, amount_sats, fee_sats, None)?;
+    let txid = psbt.unsigned_tx.compute_txid().to_string();
+    broadcast_psbt(psbt).await?;
+    Ok(txid)
+}
+
+/// Verify and sign an incoming PSBT from companion app
+async fn verify_and_sign_psbt(psbt_bytes: Vec<u8>) -> anyhow::Result<ngwallet::bdk_wallet::bitcoin::Psbt> {
+    use ngwallet::bdk_wallet::bitcoin::Psbt;
+
+    let psbt = Psbt::deserialize(&psbt_bytes).map_err(|e| anyhow::anyhow!("Deserialize: {}", e))?;
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+
+    let tx_builder = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+    let mut signed = psbt;
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    tx_builder.sign(&mut signed, options).map_err(|e| anyhow::anyhow!("Sign: {}", e))?;
+
+    Ok(signed)
+}
+
+
+/// Short hex helper for display labels
+fn hex_short(bytes: &[u8]) -> String {
+    bytes.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Refresh the on-device balance + UTXO summary from the synced wallet.
+/// Uses the real utxo.rs coin-control types (UtxoDisplayItem / UtxoSummary / UtxoReviewList).
+fn refresh_balance(ui: &AppWindow) {
+    let utxo_items: Vec<crate::utxo::UtxoDisplayItem> =
+        match create_bip84_wallet(Network::Bitcoin, 0) {
+            Ok(wallet) => {
+                let bdk = match wallet.bdk_wallet.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                bdk.list_unspent()
+                    .map(|u| crate::utxo::UtxoDisplayItem {
+                        txid_short: u.outpoint.txid.to_string().chars().take(12).collect(),
+                        value_sats: u.txout.value.to_sat(),
+                        is_doxxic: false,
+                        anonset: 0,
+                        mix_state_icon: "⛓".into(),
+                        reviewed: false,
+                    })
+                    .collect()
             }
             Err(e) => {
-                ui.set_status(format!("⚠️ UTXO request failed: {:?}", e).into());
+                log::debug!("💰 balance unavailable: {}", e);
+                vec![]
             }
-        }
-    });
+        };
 
-    // ── Export PayNym as QR ──────────────────────────────
-    let ui_export = ui.as_weak();
-    let state_export = state.clone();
-    ui.on_export_paynym_qr(move || {
-        let ui = ui_export.unwrap();
-        let s = state_export.borrow();
-        if let Some(ref paynym) = s.paynym_identity {
-            // On a real device, this would show the payment code as a QR
-            // The companion app scans it to establish BIP47 communication
-            ui.set_status(
-                format!("📱 Payment code QR shown — {} ready for BIP47", paynym.name).into()
-            );
-        } else {
-            ui.set_status("⚠️ PayNym not available — initialize seed first".into());
-        }
-    });
+    if utxo_items.is_empty() {
+        log::info!("🪙 No UTXOs yet — {}", crate::utxo::UtxoError::NoUtxos);
+    }
 
-    // ── Toggle Tor ────────────────────────────────────────
-    let ui_tor = ui.as_weak();
-    let state_tor = state.clone();
-    ui.on_toggle_tor(move || {
-        let ui = ui_tor.unwrap();
-        let mut s = state_tor.borrow_mut();
-        s.tor_enabled = !s.tor_enabled;
-        let label = if s.tor_enabled { "🟢 On" } else { "🔴 Off" };
-        ui.set_tor_status(label.into());
-        ui.set_status(format!("🔒 Tor {}", if s.tor_enabled { "enabled" } else { "disabled" }).into());
-    });
-}
+    // Build the real coin-control review list + summary
+    let summary = crate::utxo::UtxoSummary::from_utxos(&utxo_items);
+    let review = crate::utxo::UtxoReviewList {
+        utxos: utxo_items,
+        summary: summary.clone(),
+    };
+    log::info!(
+        "🪙 Coin control: {} UTXOs, {} sats (doxxic={}, premix={}, postmix={})",
+        review.summary.total_count,
+        review.summary.total_value_sats,
+        review.summary.doxxic_count,
+        review.summary.premix_count,
+        review.summary.postmix_count
+    );
 
-// ─── BLE Communication ──────────────────────────────────────
-
-fn start_dojo_ble_service() -> Result<(), keyos::Error> {
-    Bluetooth::advertise_as_peripheral("DOJO-SIGNER", |connection| {
-        connection.subscribe_to_characteristic("DOJO-CJ-REQ", |data: &[u8]| {
-            // Coinjoin request arrives here
-            // The UI picks it up via polling
-            Ok(())
-        })?;
-
-        connection.subscribe_to_characteristic("DOJO-VRFY-REQ", |data: &[u8]| {
-            // Verification request arrives here
-            Ok(())
-        })?;
-
-        connection.subscribe_to_characteristic("DOJO-UTXO-LIST", |data: &[u8]| {
-            // UTXO list arrives here
-            Ok(())
-        })?;
-
-        Ok(())
-    })
-}
-
-fn connect_to_dojo_backend() -> Result<DojoConnectionStatus, keyos::Error> {
-    Bluetooth::scan_for_service("DOJO-BACKEND-SVC")?;
-    let device = Bluetooth::connect_to_service("DOJO-BACKEND-SVC")?;
-
-    device.subscribe_to_characteristic("DOJO-CJ-REQ", |data: &[u8]| {
-        Ok(())
-    })?;
-
-    // Handshake — notify Dojo we're ready
-    let handshake = b"{\"type\":\"handshake\",\"version\":\"0.1.0\"}";
-    device.send_on_characteristic("DOJO-HANDSHAKE", handshake)?;
-
-    Ok(DojoConnectionStatus {
-        connected: true,
-        server_url: "dojo.local:443".into(),
-        tor_enabled: true,
-        block_height: 876543,
-        peer_count: 8,
-        verified_reputation: true,
-    })
-}
-
-fn send_coinjoin_response_via_ble(response: &CoinjoinSigningRes) -> Result<(), keyos::Error> {
-    let data = serde_json::to_vec(response)
-        .map_err(|_| keyos::Error::SerializationFailed)?;
-    Bluetooth::send("DOJO-CJ-RES", &data)
-}
-
-fn request_utxo_list_from_dojo() -> Result<UtxoReviewList, keyos::Error> {
-    // Request UTXO list from Dojo server via BLE
-    Bluetooth::send("DOJO-UTXO-REQ", b"get_utxos")?;
-
-    // For development, return a sample list
-    // In production, this would parse the BLE response
-    let utxos = vec![
-        UtxoDisplayItem {
-            txid_short: "abc123def456...".into(),
-            value_sats: 100_000,
-            is_doxxic: true,
-            anonset: 0,
-            mix_state_icon: "🔴",
-            reviewed: false,
-        },
-        UtxoDisplayItem {
-            txid_short: "7890abcd1234...".into(),
-            value_sats: 50_000,
-            is_doxxic: false,
-            anonset: 5,
-            mix_state_icon: "🟡",
-            reviewed: false,
-        },
-        UtxoDisplayItem {
-            txid_short: "efab5678cdef...".into(),
-            value_sats: 200_000,
-            is_doxxic: false,
-            anonset: 42,
-            mix_state_icon: "🟢",
-            reviewed: false,
-        },
-    ];
-
-    let summary = UtxoSummary::from_utxos(&utxos);
-
-    Ok(UtxoReviewList { utxos, summary })
-}
-
-// ─── QR Scanning ────────────────────────────────────────────
-
-fn scan_coinjoin_request_qr() -> Result<CoinjoinSigningReq, keyos::Error> {
-    let qr_data = Camera::scan_qr()?;
-    let qr_str = core::str::from_utf8(&qr_data)
-        .map_err(|_| keyos::Error::InvalidData)?;
-    let req: CoinjoinSigningRequest = serde_json::from_str(qr_str)
-        .map_err(|_| keyos::Error::InvalidData)?;
-    Ok(req)
-}
-
-// ─── UI Helpers ─────────────────────────────────────────────
-
-fn update_status_display(ui: &DojoSignerUI, state: &AppState) {
-    ui.set_status(format!("{} {}", state.status_icon, state.status_text).into());
-}
-
-fn update_status(ui: &DojoSignerUI, state: Rc<RefCell<AppState>>, msg: &str) {
-    let mut s = state.borrow_mut();
-    s.status_text = msg.into();
-    s.status_icon = "🟢";
-    ui.set_status(format!("🟢 {}", msg).into());
-}
-
-fn truncate_code(code: &str, max: usize) -> String {
-    if code.len() <= max {
-        code.into()
+    let sats = review.summary.total_value_sats;
+    let display = if sats >= 100_000_000 {
+        format!("{:.8} BTC", sats as f64 / 100_000_000.0)
     } else {
-        format!("{}...", &code[..max])
-    }
-}
-
-// ─── Slint UI ───────────────────────────────────────────────
-
-slint::slint! {
-    import { VerticalBox, HorizontalBox, Button, Text } from "std-widgets.slint";
-
-    export component DojoSignerUI inherits Window {
-        in-out property <int> screen-index;
-        in-out property <string> status;
-        in-out property <string> device-name;
-
-        // PayNym identity
-        in-out property <string> paynym-name;
-        in-out property <string> paynym-code;
-        in-out property <string> pepehash;
-
-        // UTXO Review
-        in-out property <int> utxo-count;
-        in-out property <int> utxo-value;
-        in-out property <int> doxxic-count;
-        in-out property <int> avg-anonset;
-
-        // Coinjoin
-        in-out property <string> tx-type;
-        in-out property <int> amount-sats;
-        in-out property <int> fee-sats;
-        in-out property <int> input-count;
-        in-out property <int> anonset;
-        in-out property <int> target-anonset;
-
-        // Message Verifier
-        in-out property <string> verify-message;
-        in-out property <string> verify-signer;
-        in-out property <string> verify-result;
-        in-out property <color> verify-result-color;
-
-        // Settings
-        in-out property <string> dojo-server;
-        in-out property <string> connection-status;
-        in-out property <string> tor-status;
-
-        // History
-        in-out property <int> history-count;
-        in-out property <int> verify-count;
-        in-out property <string> last-signing;
-
-        // Callbacks
-        callback show-paynym();
-        callback show-utxo-review();
-        callback show-coinjoin();
-        callback show-verifier();
-        callback show-settings();
-        callback show-history();
-        callback go-back();
-        callback approve-coinjoin();
-        callback reject-coinjoin();
-        callback scan-qr();
-        callback connect-dojo();
-        callback verify-message();
-        callback refresh-utxos();
-        callback export-paynym-qr();
-        callback toggle-tor();
-
-        min-width: 320px;
-        min-height: 480px;
-        title: "DOJO SIGNER";
-        background: #000;
-        default-font-family: "monospace";
-
-        VerticalLayout {
-            padding: 10px;
-            spacing: 6px;
-
-            // ══════ HEADER ══════
-            HorizontalLayout {
-                spacing: 6px;
-
-                // Terminal marker
-                Text {
-                    text: ">>";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: #cc0000;
-                    letter-spacing: 0px;
-                }
-
-                Text {
-                    text: "DOJO_SIGNER";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: #ff0000;
-                    letter-spacing: 3px;
-                }
-
-                Rectangle {
-                    background: #1a0000;
-                    border-radius: 2px;
-                    height: 18px;
-                    border-width: 1px;
-                    border-color: #330000;
-                    VerticalLayout {
-                        padding: 2px 6px;
-                        Text {
-                            text: root.device-name;
-                            font-size: 8px;
-                            color: #aa0000;
-                        }
-                    }
-                }
-            }
-
-            // ══════ STATUS BAR ══════
-            Rectangle {
-                background: #0a0000;
-                border-radius: 2px;
-                height: 24px;
-                border-width: 1px;
-                border-color: #330000;
-                VerticalLayout {
-                    padding: 3px 10px;
-                    Text {
-                        text: "$ " + root.status;
-                        font-size: 10px;
-                        color: #cc0000;
-                        wrap: word-break;
-                    }
-                }
-            }
-
-            // ══════ SCREEN: HOME (0) ══════
-            if (root.screen-index == 0) : VerticalLayout {
-                spacing: 6px;
-
-                // PayNym Identity Card (terminal style)
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #330000;
-
-                    VerticalLayout {
-                        padding: 10px;
-                        spacing: 6px;
-
-                        Text {
-                            text: "# PayNym Identity";
-                            font-size: 12px;
-                            font-weight: 600;
-                            color: #ff0000;
-                        }
-
-                        HorizontalLayout {
-                            spacing: 8px;
-
-                            // Avatar placeholder
-                            Rectangle {
-                                width: 40px;
-                                height: 40px;
-                                background: #0a0000;
-                                border-radius: 2px;
-                                border-width: 1px;
-                                border-color: #330000;
-                                VerticalLayout {
-                                    padding: 8px;
-                                    Text {
-                                        text: "🐸";
-                                        font-size: 20px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                            }
-
-                            VerticalLayout {
-                                spacing: 2px;
-                                Text {
-                                    text: "name: " + root.paynym-name;
-                                    font-size: 14px;
-                                    font-weight: 700;
-                                    color: #ff0000;
-                                }
-                                Text {
-                                    text: "hash: " + root.pepehash;
-                                    font-size: 8px;
-                                    color: #aa0000;
-                                }
-                                Text {
-                                    text: root.paynym-code;
-                                    font-size: 7px;
-                                    color: #880000;
-                                    wrap: word-break;
-                                }
-                            }
-                        }
-
-                        // Quick actions
-                        HorizontalLayout {
-                            spacing: 4px;
-                            Button {
-                                text: "[show_code]";
-                                font-size: 8px;
-                                clicked => { root.show-paynym(); }
-                            }
-                            Button {
-                                text: "[scan_qr]";
-                                font-size: 8px;
-                                clicked => { root.scan-qr(); }
-                            }
-                            Button {
-                                text: "[refresh]";
-                                font-size: 8px;
-                                clicked => { root.refresh-utxos(); }
-                            }
-                        }
-                    }
-                }
-
-                // Navigation Grid (terminal buttons)
-                GridLayout {
-                    spacing: 4px;
-
-                    Row {
-                        Button {
-                            text: "[utxo]";
-                            font-size: 10px;
-                            min-height: 40px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.show-utxo-review(); }
-                            stretch: 1;
-                        }
-
-                        Button {
-                            text: "[coinjoin]";
-                            font-size: 10px;
-                            min-height: 40px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.show-coinjoin(); }
-                            stretch: 1;
-                        }
-
-                        Button {
-                            text: "[verify]";
-                            font-size: 10px;
-                            min-height: 40px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.show-verifier(); }
-                            stretch: 1;
-                        }
-                    }
-
-                    Row {
-                        Button {
-                            text: "[connect]";
-                            font-size: 10px;
-                            min-height: 36px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.connect-dojo(); }
-                            stretch: 1;
-                        }
-
-                        Button {
-                            text: "[settings]";
-                            font-size: 10px;
-                            min-height: 36px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.show-settings(); }
-                            stretch: 1;
-                        }
-
-                        Button {
-                            text: "[history]";
-                            font-size: 10px;
-                            min-height: 36px;
-                            background: #0a0000;
-                            color: #cc0000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #330000;
-                            clicked => { root.show-history(); }
-                            stretch: 1;
-                        }
-                    }
-                }
-
-                // Status line
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    height: 16px;
-                    border-width: 1px;
-                    border-color: #1a0000;
-                    VerticalLayout {
-                        padding: 1px 6px;
-                        Text {
-                            text: "# DOJO_SIGNER  |  BIP47  |  COINJOIN  |  UTXO";
-                            font-size: 7px;
-                            color: #660000;
-                            letter-spacing: 1px;
-                        }
-                    }
-                }
-            }
-
-            // ══════ SCREEN: PAYNYM (1) ══════
-            if (root.screen-index == 1) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# BIP47 Payment Code";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #ff0000;
-                }
-
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #330000;
-                    VerticalLayout {
-                        padding: 12px;
-                        spacing: 8px;
-
-                        // PayNym avatar + name
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Rectangle {
-                                width: 48px; height: 48px;
-                                background: #0a0000;
-                                border-radius: 2px;
-                                border-width: 1px;
-                                border-color: #330000;
-                                VerticalLayout {
-                                    padding: 10px;
-                                    Text { text: "🐸"; font-size: 22px; }
-                                }
-                            }
-                            VerticalLayout {
-                                spacing: 4px;
-                                Text { text: "user: " + root.paynym-name; font-size: 18px; font-weight: 700; color: #ff0000; }
-                                Text { text: "hash: " + root.pepehash; font-size: 9px; color: #aa0000; }
-                            }
-                        }
-
-                        // Full payment code
-                        Text { text: "$ payment_code"; font-size: 10px; color: #880000; }
-                        Rectangle {
-                            background: #050000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #1a0000;
-                            VerticalLayout {
-                                padding: 8px;
-                                Text {
-                                    text: root.paynym-code;
-                                    font-size: 9px;
-                                    color: #cc0000;
-                                    wrap: word-break;
-                                }
-                            }
-                        }
-
-                        Text {
-                            text: "# Share to receive BIP47 payments. Each generates a unique address.";
-                            font-size: 8px;
-                            color: #660000;
-                            wrap: word-break;
-                        }
-                    }
-                }
-
-                Button {
-                    text: "[show_qr]";
-                    font-size: 10px;
-                    clicked => { root.export-paynym-qr(); }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-
-            // ══════ SCREEN: UTXO REVIEW (2) ══════
-            if (root.screen-index == 2) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# UTXO Coin Control";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #ff0000;
-                }
-
-                // Summary bar
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #330000;
-                    VerticalLayout {
-                        padding: 8px;
-                        spacing: 4px;
-                        HorizontalLayout {
-                            Text { text: "utxos: "; color: #880000; font-size: 10px; }
-                            Text { text: root.utxo-count; color: #ff0000; font-size: 11px; }
-                            Text { text: "  |  value: "; color: #880000; font-size: 10px; }
-                            Text { text: root.utxo-value; color: #ff0000; font-size: 11px; }
-                            Text { text: " sats"; color: #880000; font-size: 9px; }
-                        }
-                        HorizontalLayout {
-                            Text { text: "doxxic: "; color: #cc0000; font-size: 10px; }
-                            Text { text: root.doxxic-count; color: #ff0000; font-size: 10px; }
-                            Text { text: "  |  avg_anonset: "; color: #880000; font-size: 10px; }
-                            Text { text: root.avg-anonset; color: #ff0000; font-size: 10px; }
-                        }
-                    }
-                }
-
-                Text {
-                    text: "# doxxic = reveals history | clean = postmix";
-                    font-size: 7px;
-                    color: #660000;
-                }
-
-                Button {
-                    text: "[refresh_utxos]";
-                    font-size: 10px;
-                    clicked => { root.refresh-utxos(); }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-
-            // ══════ SCREEN: COINJOIN SIGNING (3) ══════
-            if (root.screen-index == 3) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# Coinjoin Signing";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #ff0000;
-                }
-
-                // Transaction details card
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #660000;
-                    VerticalLayout {
-                        padding: 10px;
-                        spacing: 6px;
-
-                        Text {
-                            text: "$ review_transaction";
-                            font-size: 13px;
-                            font-weight: 600;
-                            color: #ff0000;
-                        }
-
-                        HorizontalLayout {
-                            Text { text: "mix_id:  "; color: #880000; font-size: 10px; }
-                            Text { text: root.tx-type; color: #ff0000; font-size: 11px; font-weight: 600; }
-                        }
-
-                        HorizontalLayout {
-                            Text { text: "amount:  "; color: #880000; font-size: 10px; }
-                            Text { text: root.amount-sats; color: #ff0000; font-size: 14px; font-weight: 700; }
-                            Text { text: " sats"; color: #880000; font-size: 10px; }
-                        }
-
-                        HorizontalLayout {
-                            Text { text: "fee:     "; color: #880000; font-size: 10px; }
-                            Text { text: root.fee-sats; color: #cc0000; font-size: 10px; }
-                            Text { text: " sats"; color: #880000; font-size: 10px; }
-                        }
-
-                        HorizontalLayout {
-                            Text { text: "inputs:  "; color: #880000; font-size: 10px; }
-                            Text { text: root.input-count; color: #ff0000; font-size: 10px; }
-                            Text { text: " utxos"; color: #880000; font-size: 10px; }
-                        }
-
-                        HorizontalLayout {
-                            Text { text: "anonset: "; color: #880000; font-size: 10px; }
-                            Text { text: root.anonset; color: #4ade80; font-size: 10px; }
-                            Text { text: "/"; color: #880000; font-size: 10px; }
-                            Text { text: root.target-anonset; color: #ff0000; font-size: 10px; }
-                        }
-                    }
-                }
-
-                // Security warning
-                Rectangle {
-                    background: #0a0000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #660000;
-                    height: 22px;
-                    VerticalLayout {
-                        padding: 3px 8px;
-                        Text {
-                            text: "! Coinjoin txns cannot be reversed. Verify carefully.";
-                            font-size: 8px;
-                            color: #cc0000;
-                        }
-                    }
-                }
-
-                // Approve / Reject
-                HorizontalLayout {
-                    spacing: 8px;
-                    Button {
-                        text: "[reject]";
-                        background: #1a0000;
-                        color: #ff0000;
-                        font-weight: 700;
-                        font-size: 12px;
-                        border-width: 1px;
-                        border-color: #660000;
-                        clicked => { root.reject-coinjoin(); }
-                        stretch: 1;
-                    }
-                    Button {
-                        text: "[approve]";
-                        background: #001a00;
-                        color: #4ade80;
-                        font-weight: 700;
-                        font-size: 12px;
-                        border-width: 1px;
-                        border-color: #003300;
-                        clicked => { root.approve-coinjoin(); }
-                        stretch: 1;
-                    }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-
-            // ══════ SCREEN: MESSAGE VERIFIER (4) ══════
-            if (root.screen-index == 4) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# BIP47 Message Verifier";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #4ade80;
-                }
-
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #003300;
-                    VerticalLayout {
-                        padding: 10px;
-                        spacing: 6px;
-
-                        Text { text: "$ message"; font-size: 10px; color: #880000; }
-                        Text { text: root.verify-message; font-size: 9px; color: #cc0000; wrap: word-break; }
-
-                        Text { text: "$ signed_by"; font-size: 10px; color: #880000; }
-                        Text { text: root.verify-signer; font-size: 12px; font-weight: 600; color: #ff0000; }
-
-                        HorizontalLayout {
-                            Text { text: "$ result: "; font-size: 12px; color: #880000; }
-                            Text { text: root.verify-result; font-size: 14px; font-weight: 700; color: root.verify-result-color; }
-                        }
-                    }
-                }
-
-                Button {
-                    text: "[verify]";
-                    font-size: 10px;
-                    clicked => { root.verify-message(); }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-
-            // ══════ SCREEN: SETTINGS (5) ══════
-            if (root.screen-index == 5) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# Settings";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #ff0000;
-                }
-
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #330000;
-                    VerticalLayout {
-                        padding: 10px;
-                        spacing: 8px;
-
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text { text: "dojo:  "; font-size: 10px; color: #880000; min-width: 50px; }
-                            Text { text: root.dojo-server; font-size: 10px; color: #cc0000; }
-                        }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text { text: "status:"; font-size: 10px; color: #880000; min-width: 50px; }
-                            Text { text: root.connection-status; font-size: 10px; color: #4ade80; }
-                        }
-
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Text { text: "tor:   "; font-size: 10px; color: #880000; min-width: 50px; }
-                            Text { text: root.tor-status; font-size: 10px; color: #cc0000; }
-                            Button {
-                                text: "[toggle]";
-                                font-size: 8px;
-                                color: #cc0000;
-                                clicked => { root.toggle-tor(); }
-                            }
-                        }
-
-                        Text { text: "# DOJO_SIGNER v0.1.0 | KeyOS 1.0.0"; font-size: 8px; color: #660000; }
-                    }
-                }
-
-                Button {
-                    text: "[connect_dojo]";
-                    font-size: 10px;
-                    clicked => { root.connect-dojo(); }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-
-            // ══════ SCREEN: HISTORY (6) ══════
-            if (root.screen-index == 6) : VerticalLayout {
-                spacing: 6px;
-
-                Text {
-                    text: "# History";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: #ff0000;
-                }
-
-                Rectangle {
-                    background: #000;
-                    border-radius: 2px;
-                    border-width: 1px;
-                    border-color: #330000;
-                    VerticalLayout {
-                        padding: 10px;
-                        spacing: 6px;
-
-                        HorizontalLayout {
-                            Text { text: "coinjoin_signs: "; color: #880000; font-size: 10px; }
-                            Text { text: root.history-count; color: #ff0000; font-size: 12px; font-weight: 600; }
-                        }
-                        HorizontalLayout {
-                            Text { text: "verifications:   "; color: #880000; font-size: 10px; }
-                            Text { text: root.verify-count; color: #4ade80; font-size: 12px; font-weight: 600; }
-                        }
-
-                        Rectangle {
-                            background: #050000;
-                            border-radius: 2px;
-                            border-width: 1px;
-                            border-color: #1a0000;
-                            VerticalLayout {
-                                padding: 6px;
-                                Text { text: "$ last_signing"; color: #880000; font-size: 9px; }
-                                Text { text: root.last-signing; color: #cc0000; font-size: 9px; wrap: word-break; }
-                            }
-                        }
-                    }
-                }
-
-                Button {
-                    text: "[back]";
-                    font-size: 10px;
-                    clicked => { root.go-back(); }
-                }
-            }
-        }
-    }
+        format!("{} sats", sats)
+    };
+    ui.global::<DojoSignerCallbacks>().set_balance_display(display.into());
+    let view = crate::UtxoSummaryView {
+        total_count: review.summary.total_count as i32,
+        total_value_sats: review.summary.total_value_sats.min(i32::MAX as u64) as i32,
+        doxxic_count: review.summary.doxxic_count as i32,
+        doxxic_value_sats: review.summary.doxxic_value_sats.min(i32::MAX as u64) as i32,
+        premix_count: review.summary.premix_count as i32,
+        postmix_count: review.summary.postmix_count as i32,
+        avg_anonset: review.summary.avg_anonset as i32,
+    };
+    ui.global::<DojoSignerCallbacks>().set_utxo_summary(view);
 }

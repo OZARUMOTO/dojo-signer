@@ -1,0 +1,97 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component CoinjoinPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Whirlpool Coinjoin"; color: #ff00ff; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Mix ID: " + CB.mix-id; color: #888; font-size: 9px; }
+                Text { text: "Status: " + CB.mix-status; color: #ff44ff; font-size: 12px; font-weight: 600; }
+                Text { text: "Inputs: " + CB.mix-input-count + " — " + CB.mix-input-sats; color: #aaa; font-size: 9px; }
+                Text { text: "Pool: " + CB.pool-selection; color: #ff44ff; font-size: 9px; }
+                Text { text: "Pipeline: CONFIRM_INPUT → REGISTER_OUTPUT → REVEAL_OUTPUT → SIGNING → SUCCESS"; color: #555; font-size: 8px; }
+
+                // Pool selection (Whirlpool denominations)
+                HorizontalLayout { spacing: 2px;
+                    Rectangle {
+                        height: 20px; background: #111; border-radius: 2px; border-width: 1px; border-color: #330033;
+                        TouchArea { clicked => { CB.select-pool("0.5btc"); } }
+                        Text { text: "0.5"; color: #f6f; font-size: 8px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: #111; border-radius: 2px; border-width: 1px; border-color: #330033;
+                        TouchArea { clicked => { CB.select-pool("0.25btc"); } }
+                        Text { text: "0.25"; color: #f6f; font-size: 8px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: #111; border-radius: 2px; border-width: 1px; border-color: #330033;
+                        TouchArea { clicked => { CB.select-pool("0.1btc"); } }
+                        Text { text: "0.1"; color: #f6f; font-size: 8px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: #111; border-radius: 2px; border-width: 1px; border-color: #330033;
+                        TouchArea { clicked => { CB.select-pool("0.05btc"); } }
+                        Text { text: "0.05"; color: #f6f; font-size: 8px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: #111; border-radius: 2px; border-width: 1px; border-color: #330033;
+                        TouchArea { clicked => { CB.select-pool("0.01btc"); } }
+                        Text { text: "0.01"; color: #f6f; font-size: 8px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                // Progress bar
+                Rectangle {
+                    height: 8px; background: #111; border-radius: 2px;
+                    Rectangle {
+                        width: parent.width * CB.mix-progress / 100;
+                        height: 8px; background: #f0f; border-radius: 2px;
+                    }
+                }
+
+                Text { text: "Progress: " + CB.mix-progress + "%"; color: #666; font-size: 9px; }
+                Text { text: CB.mix-error; color: #f00; font-size: 9px; }
+
+                GridLayout { spacing: 4px;
+                    Rectangle {
+                        height: 24px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;
+                        TouchArea { clicked => { CB.approve-coinjoin(); } }
+                        Text { text: "APPROVE SIGN"; color: #0f0; font-size: 11px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 24px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                        TouchArea { clicked => { CB.reject-coinjoin(); } }
+                        Text { text: "REJECT"; color: #f44; font-size: 11px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Text { text: "Connect your node before using Whirlpool. Use BLE companion for full mixing."; color: #555; font-size: 9px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+export struct PayNymView {
+    name: string,
+    payment_code: string,
+    pepehash: string,
+    notification_address: string,
+}
+
+export struct UtxoSummaryView {
+    total_count: int,
+    total_value_sats: int,
+    doxxic_count: int,
+    doxxic_value_sats: int,
+    premix_count: int,
+    postmix_count: int,
+    avg_anonset: int,
+}

@@ -1,0 +1,97 @@
+import { PayNymView, UtxoSummaryView } from "./dojo-signer-types.slint";
+
+export global DojoSignerCallbacks {
+    // ============ STATE ============
+    // Home identity card
+    in-out property <PayNymView> paynym: { name: "Loading...", payment_code: "", pepehash: "", notification_address: "" };
+    in-out property <string> connection-status: "Initializing";
+    in-out property <string> balance-display: "0 sats";
+    in-out property <string> ble-status: "Not paired";
+
+    // UTXO summary (coin control)
+    in-out property <UtxoSummaryView> utxo-summary: { total_count: 0, total_value_sats: 0, doxxic_count: 0, doxxic_value_sats: 0, premix_count: 0, postmix_count: 0, avg_anonset: 0 };
+
+    // Send page
+    in-out property <string> send-address: "";
+    in-out property <string> send-amount: "";
+    in-out property <string> send-fee: "";
+    in-out property <string> send-status: "";
+    in-out property <string> send-error: "";
+
+    // Receive page
+    in-out property <string> receive-address: "Tap to generate";
+    in-out property <string> receive-error: "";
+
+    // Settings / node connection
+    in-out property <string> host-input: "127.0.0.1";
+    in-out property <string> port-input: "50002";
+    in-out property <bool> ssl-input: true;
+    in-out property <string> username-input: "";
+    in-out property <string> password-input: "";
+    in-out property <string> node-status: "Disconnected";
+
+    // Coinjoin / Whirlpool
+    in-out property <string> mix-id: "awaiting_dojo_connection";
+    in-out property <string> mix-status: "Idle";
+    in-out property <int> mix-progress: 0;
+    in-out property <string> mix-error: "";
+    in-out property <int> mix-input-count: 0;
+    in-out property <string> mix-input-sats: "0 sats";
+    in-out property <string> pool-selection: "0.5btc";
+
+    // Verify page
+    in-out property <string> verify-result: "";
+    in-out property <string> verify-error: "";
+    in-out property <string> verify-message-input: "";
+    in-out property <string> verify-signature-input: "";
+    in-out property <string> verify-paycode-input: "PM8T...";
+    in-out property <string> verify-history: "";
+
+    // PayNym QR export / scanned contact
+    in-out property <image> paynym-qr-image;
+    in-out property <bool> show-paynym-qr: false;
+    in-out property <string> scanned-contact: "";
+
+    // Receive QR
+    in-out property <image> receive-qr-image;
+    in-out property <bool> show-receive-qr: false;
+
+    // ============ CALLBACKS ============
+    // Navigation
+    callback goto-home();
+    callback goto-pay-nym();
+    callback goto-send();
+    callback goto-receive();
+    callback goto-settings();
+    callback goto-utxo();
+    callback goto-coinjoin();
+    callback goto-verify();
+
+    // Identity
+    callback refresh-identity();
+    callback refresh-balance();
+
+    // Send
+    callback send-btc(string, string, string);
+
+    // Receive
+    callback receive-new-address();
+
+    // Node connection
+    callback connect-node(string, string, bool, string, string);
+    callback disconnect-node();
+
+    // QR Scan
+    callback scan-qr-address();
+    callback scan-paynym-qr();
+    callback scan-verify-qr();
+    callback verify-message(string, string, string);
+
+    // PayNym
+    callback export-paynym-qr(string);
+
+    // Whirlpool / Coinjoin
+    callback approve-coinjoin();
+    callback reject-coinjoin();
+    callback select-pool(string);
+}
