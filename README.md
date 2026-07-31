@@ -11,6 +11,39 @@ DOJO SIGNER is a [KeyOS](https://docs.foundation.xyz/) app for the [Foundation P
 
 Every cryptographic derivation in this app is verified byte-for-byte against the **official Samourai BIP47 test vectors** (see [Testing](#-testing)).
 
+---
+
+## 🎬 Preview
+
+**Full walkthrough (screen recording):**
+
+<p align="center">
+  <img src="docs/screenshots/demo-walkthrough.gif" width="320" alt="DOJO SIGNER — end-to-end walkthrough"/>
+</p>
+
+**Screenshots** (captured in the KeyOS hosted simulator):
+
+| Screen | Capture |
+|--------|---------|
+| **Home** — PayNym identity + balance | <img src="docs/screenshots/home.png" width="220" alt="DOJO SIGNER home screen"/> |
+| **PayNym** — payment code + notification address | <img src="docs/screenshots/paynym-derivation.png" width="220" alt="PayNym derivation"/> |
+| **Send** — BIP47 / on-chain | <img src="docs/screenshots/send-btc.png" width="220" alt="Send BTC"/> |
+| **Receive** — real BIP84 address + QR | <img src="docs/screenshots/receive-btc.png" width="220" alt="Receive BTC"/> |
+| **Settings** — node config + BLE | <img src="docs/screenshots/node-settings.png" width="220" alt="Node settings"/> |
+| **UTXO** — coin control | <img src="docs/screenshots/utxo-control.png" width="220" alt="UTXO coin control"/> |
+| **Coinjoin** — Whirlpool signing + pool selection | <img src="docs/screenshots/whirlpool-signing.png" width="220" alt="Whirlpool coinjoin signing"/> |
+| **Verify** — BIP47 message verifier + history | <img src="docs/screenshots/bip47-verifier.png" width="220" alt="BIP47 message verifier"/> |
+
+> These are raw simulator captures — no device frames, as requested.
+>
+> They cover the main flows, including **PayNym derivation**, **Whirlpool signing**, **UTXO coin control**, and the **BIP47 message verifier**.
+
+---
+
+## 🖥️ Interface
+
+Terminal-styled secure display — black background, red monospace text:
+
 ```
   >> DOJO_SIGNER
   $ 🟢 Ready — PayNym: +ozarumoto, PC: PM8T...
