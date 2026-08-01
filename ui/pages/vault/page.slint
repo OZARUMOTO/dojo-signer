@@ -1,0 +1,209 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component VaultPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# MuSig2 Vault (3-of-3)"; color: #ffaa00; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "My device code"; color: #888; font-size: 9px; }
+                Text { text: CB.vault-my-code; color: #0aa; font-size: 9px; wrap: word-wrap; }
+
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 22px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                        TouchArea { clicked => { CB.vault-export-setup(); } }
+                        Text { text: "📷 Export My Code"; color: #fa0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                        TouchArea { clicked => { CB.vault-scan-setup(); } }
+                        Text { text: "📷 Scan Device"; color: #0aa; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Text {
+                    text: "Devices: " + CB.vault-participants + "/3";
+                    color: #ffaa00; font-size: 11px; font-weight: 700;
+                }
+
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 24px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                        TouchArea { clicked => { CB.vault-build(); } }
+                        Text { text: "🔨 BUILD VAULT"; color: #fa0; font-size: 11px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 24px; background: #200; border-radius: 2px; border-width: 1px; border-color: #601;
+                        visible: CB.vault-demo-enabled;
+                        TouchArea { clicked => { CB.vault-demo-inject(); } }
+                        Text { text: "🧪 INJECT DEMO"; color: #f66; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Text {
+                    text: "Vault code: " + CB.vault-aggregate;
+                    color: #0f0; font-size: 9px; wrap: word-wrap;
+                    visible: CB.vault-aggregate != "";
+                }
+                Text {
+                    text: "Notification: " + CB.vault-notif;
+                    color: #0f0; font-size: 9px; wrap: word-wrap;
+                    visible: CB.vault-notif != "";
+                }
+                Text {
+                    text: "Receive: " + CB.vault-receive-addr;
+                    color: #0f0; font-size: 9px; wrap: word-wrap;
+                    visible: CB.vault-receive-addr != "";
+                }
+                Rectangle {
+                    height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                    visible: CB.vault-aggregate != "";
+                    TouchArea { clicked => { CB.vault-receive-new(); } }
+                    Text { text: "📷 Receive Address QR"; color: #0aa; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Rectangle {
+                    height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                    visible: CB.vault-aggregate != "";
+                    TouchArea { clicked => { CB.vault-export-vault(); } }
+                    Text { text: "📷 Show Vault Code QR"; color: #0aa; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "# Spend (4 QR rounds)"; color: #ff4040; font-size: 12px; font-weight: 700; }
+
+                Text { text: "Authorization (signed digest)"; color: #888; font-size: 9px; }
+                TextInput {
+                    text <=> CB.vault-spend-msg;
+                    color: #fff; font-size: 9px;
+                }
+                Rectangle {
+                    height: 20px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                    TouchArea { clicked => { CB.vault-new-spend(); } }
+                    Text { text: "🆕 New Spend Session"; color: #f44; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 22px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                        visible: !CB.vault-demo-enabled;
+                        TouchArea { clicked => { CB.vault-gen-nonce(); } }
+                        Text { text: "R1: My Nonce"; color: #fa0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                        TouchArea { clicked => { CB.vault-scan-nonce(); } }
+                        Text { text: "R1: Scan Nonce"; color: #0aa; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #200; border-radius: 2px; border-width: 1px; border-color: #601;
+                        visible: CB.vault-demo-enabled;
+                        TouchArea { clicked => { CB.vault-demo-nonces(); } }
+                        Text { text: "🧪 DEMO R1"; color: #f66; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 22px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                        TouchArea { clicked => { CB.vault-build-session(); } }
+                        Text { text: "R2: Build Session"; color: #fa0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                        TouchArea { clicked => { CB.vault-scan-session(); } }
+                        Text { text: "R2: Scan Session"; color: #0aa; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 22px; background: #200; border-radius: 2px; border-width: 1px; border-color: #500;
+                        visible: !CB.vault-demo-enabled;
+                        TouchArea { clicked => { CB.vault-sign(); } }
+                        Text { text: "R3: Sign"; color: #f44; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                        TouchArea { clicked => { CB.vault-scan-psig(); } }
+                        Text { text: "R3: Scan Psig"; color: #0aa; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 22px; background: #200; border-radius: 2px; border-width: 1px; border-color: #601;
+                        visible: CB.vault-demo-enabled;
+                        TouchArea { clicked => { CB.vault-demo-psigs(); } }
+                        Text { text: "🧪 DEMO R3"; color: #f66; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Rectangle {
+                    height: 24px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;
+                    TouchArea { clicked => { CB.vault-finalize(); } }
+                    Text { text: "R4: FINALIZE & VERIFY"; color: #0f0; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: CB.vault-round; color: #0aa; font-size: 9px; wrap: word-wrap; }
+                Text {
+                    text: "Final BIP340 sig: " + CB.vault-sig;
+                    color: #0f0; font-size: 9px; wrap: word-wrap;
+                    visible: CB.vault-sig != "";
+                }
+
+                Text { text: CB.vault-error; color: #f00; font-size: 9px; wrap: word-wrap; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px;
+            height: 150px;
+            visible: CB.show-vault-qr;
+            VerticalLayout { padding: 4px; spacing: 2px;
+                Text { text: CB.vault-qr-label; color: #888; font-size: 9px; }
+                Image {
+                    source: CB.vault-qr-image;
+                    height: 120px; width: 120px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        Rectangle {
+            height: 18px; background: #0a0000; border-radius: 2px;
+            TouchArea { clicked => { CB.goto-home(); } }
+            Text { text: "[back]"; color: #c44; font-size: 9px;
+                horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+}

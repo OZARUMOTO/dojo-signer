@@ -97,5 +97,26 @@ export component HomePage inherits BasePage {
                 }
             }
         }
+
+        GridLayout { spacing: 3px;
+            Rectangle { background: #221100; border-radius: 2px; border-color: #553300; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "VAULT"; color: #ffaa00; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    Text { text: "MuSig2 3-of-3"; color: #886600; font-size: 8px;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-vault(); } }
+                }
+            }
+            Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
+                VerticalLayout { padding: 4px;
+                    Text { text: "INFO"; color: #ff2020; font-size: 12px; font-weight: 700;
+                        horizontal-alignment: center; }
+                    Text { text: "v0.1"; color: #660000; font-size: 8px;
+                        horizontal-alignment: center; }
+                    TouchArea { clicked => { CB.goto-home(); } }
+                }
+            }
+        }
     }
 }

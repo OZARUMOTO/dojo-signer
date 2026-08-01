@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ngwallet::{
     bdk_wallet::{
         bitcoin::{
-            secp256k1::Secp256k1,
+            secp256k1::{Secp256k1, SecretKey},
             sign_message::{MessageSignature, signed_msg_hash},
             hashes::Hash,
             Network, PubkeyHash,
@@ -36,6 +36,8 @@ use slint_keyos_platform::{
 use std::sync::Mutex;
 
 mod bip47;
+mod musig;
+mod vault;
 mod coinjoin;
 mod message;
 mod utxo;
@@ -54,6 +56,42 @@ pub use coinjoin::{
 static PENDING_PSBT: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// Pending Whirlpool protocol signing request
 static PENDING_SIGNING: Mutex<Option<SigningRequest>> = Mutex::new(None);
+
+/// MuSig2 vault: participant payment codes collected via QR, the built
+/// vault config, and the active spend session (in-memory; the vault config
+/// is also persisted in AppConfig so it survives a reboot).
+static VAULT_PARTICIPANTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static VAULT_CONFIG: Mutex<Option<vault::VaultConfig>> = Mutex::new(None);
+static VAULT_SPEND: Mutex<Option<vault::VaultSpend>> = Mutex::new(None);
+
+/// Apply a built `VaultConfig` to the UI + persisted config. Shared by the
+/// BUILD VAULT button and the gated KEYOS_DEMO_VAULT demo injector so both
+/// paths behave identically.
+fn apply_vault_build(ui: &AppWindow, parts: &[String]) {
+    match vault::VaultConfig::build(parts) {
+        Ok(v) => {
+            let cb = ui.global::<DojoSignerCallbacks>();
+            cb.set_vault_aggregate(v.aggregate_code.clone().into());
+            cb.set_vault_participants(v.participants.len() as i32);
+            match v.notification_address() {
+                Ok(n) => cb.set_vault_notif(n.into()),
+                Err(e) => log::warn!("⚠️ vault notif: {}", e),
+            }
+            // Persist so the vault survives a reboot.
+            let mut cfg = load_app_config();
+            cfg.vault_participants = v.participants.clone();
+            cfg.vault_aggregate = v.aggregate_code.clone();
+            save_app_config(&cfg);
+            *VAULT_CONFIG.lock().unwrap() = Some(v.clone());
+            cb.set_vault_round("✅ Vault built — every device computes the same code".into());
+            log::info!("🏦 Vault built: {} ({})", v.aggregate_code, v.participants.len());
+        }
+        Err(e) => {
+            ui.global::<DojoSignerCallbacks>()
+                .set_vault_error(format!("Build failed: {}", e).into())
+        }
+    }
+}
 
 /// Open the system QR scanner and return the scanned text (if any).
 fn open_scan() -> Option<String> {
@@ -174,10 +212,27 @@ struct AppConfig {
     /// BIP47 message verification history (last 20).
     #[serde(default)]
     verification_history: Vec<message::VerificationHistoryEntry>,
+    /// MuSig2 vault: participant payment codes (persisted so the vault
+    /// survives a reboot) + the aggregate code every device computes.
+    #[serde(default)]
+    vault_participants: Vec<String>,
+    #[serde(default)]
+    vault_aggregate: String,
+    /// Next receive-address child index for the vault (persisted so a reboot
+    /// can never re-offer an already-derived address — addresses are
+    /// deterministic per index).
+    #[serde(default = "default_vault_receive_index")]
+    vault_receive_index: u32,
 }
 
 fn default_pool_id() -> String {
     "0.5btc".into()
+}
+
+/// Vault receive addresses start at child index 1 (index 0 is the BIP47
+/// notification address, shown separately).
+fn default_vault_receive_index() -> u32 {
+    1
 }
 
 /// Render the persisted BIP47 verification history for the Verify page.
@@ -566,6 +621,24 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 cfg.ssl
             );
         }
+
+        // Restore the MuSig2 vault if it was built before the reboot.
+        if !cfg.vault_participants.is_empty() {
+            match vault::VaultConfig::build(&cfg.vault_participants) {
+                Ok(v) => {
+                    *VAULT_PARTICIPANTS.lock().unwrap() = cfg.vault_participants.clone();
+                    *VAULT_CONFIG.lock().unwrap() = Some(v.clone());
+                    global.set_vault_participants(v.participants.len() as i32);
+                    global.set_vault_aggregate(v.aggregate_code.clone().into());
+                    match v.notification_address() {
+                        Ok(n) => global.set_vault_notif(n.into()),
+                        Err(e) => log::warn!("⚠️ vault notif: {}", e),
+                    }
+                    log::info!("🏦 Restored MuSig2 vault ({} devices)", v.participants.len());
+                }
+                Err(e) => log::warn!("⚠️ stored vault could not be rebuilt: {}", e),
+            }
+        }
     }
 
     // ---- Navigation ----
@@ -641,6 +714,15 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             move || {
                 let ui = ui_weak.unwrap();
                 ui.global::<Navigate>().invoke_verify(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+            }
+        });
+        global.on_goto_vault({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_vault(NavigateOptions {
                     replace: false, animate: Animate::None,
                 });
             }
@@ -1320,6 +1402,645 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 );
             }
         }).detach();
+    }
+
+    // ---- MuSig2 Vault (3-of-3) ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+
+        // Show this device's own BIP47 payment code (its vault contribution).
+        {
+            let ui_weak = ui_weak.clone();
+            let identity = PayNymIdentity::from_device().unwrap_or(PayNymIdentity {
+                name: "ERR".into(),
+                payment_code: "".into(),
+                pepehash: "".into(),
+                notification_address: "".into(),
+            });
+            let ui = ui_weak.unwrap();
+            ui.global::<DojoSignerCallbacks>().set_vault_my_code(identity.payment_code.into());
+        }
+
+        // R0-SETUP: export this device's payment code as a QR.
+        let ui_weak_export = ui_weak.clone();
+        global.on_vault_export_setup(move || {
+            let ui = ui_weak_export.unwrap();
+            let identity = PayNymIdentity::from_device().unwrap_or(PayNymIdentity {
+                name: "ERR".into(),
+                payment_code: "".into(),
+                pepehash: "".into(),
+                notification_address: "".into(),
+            });
+            if identity.payment_code.is_empty() {
+                ui.global::<DojoSignerCallbacks>()
+                    .set_vault_error("No device identity available".into());
+                return;
+            }
+            let payload = vault::VaultQr::Setup(identity.payment_code).encode();
+            let qr = qrcode::render(
+                payload.as_bytes(),
+                Color::from_rgb_u8(0, 0, 0),
+                Color::from_rgb_u8(255, 255, 255),
+            );
+            let cb = ui.global::<DojoSignerCallbacks>();
+            cb.set_vault_qr_image(qr);
+            cb.set_show_vault_qr(true);
+            cb.set_vault_qr_label("My device code — scan from another device".into());
+            log::info!("🏦 Exported device code QR for vault setup");
+        });
+
+        // R0-SETUP: scan another device's payment code and add it.
+        let ui_weak_scan = ui_weak.clone();
+        global.on_vault_scan_setup(move || {
+            let ui = ui_weak_scan.unwrap();
+            match open_scan() {
+                Some(text) => match vault::VaultQr::decode(&text) {
+                    Ok(vault::VaultQr::Setup(code)) => {
+                        let mut parts = VAULT_PARTICIPANTS.lock().unwrap();
+                        if !parts.iter().any(|p| p == &code) {
+                            parts.push(code);
+                        }
+                        let n = parts.len();
+                        drop(parts);
+                        ui.global::<DojoSignerCallbacks>().set_vault_participants(n as i32);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_round(format!("📥 Device added — {} collected", n).into());
+                        log::info!("🏦 Vault device added ({}/{})", n, 3);
+                    }
+                    Ok(_) => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error("Scanned QR is not a device setup code".into())
+                    }
+                    Err(e) => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Invalid code: {}", e).into())
+                    }
+                },
+                None => {
+                    ui.global::<DojoSignerCallbacks>().set_vault_error("Scan cancelled".into())
+                }
+            }
+        });
+
+        // R0-SETUP: build the aggregate vault from the collected codes.
+        let ui_weak_build = ui_weak.clone();
+        global.on_vault_build(move || {
+            let ui = ui_weak_build.unwrap();
+            let parts = VAULT_PARTICIPANTS.lock().unwrap().clone();
+            apply_vault_build(&ui, &parts);
+        });
+
+        // DEV-ONLY (KEYOS_DEMO_VAULT=1): inject three deterministic fixture
+        // devices so the vault can be built on a single simulator device and
+        // the full receive + spend flow demoed/screenshotted. Unreachable in
+        // a shipped build unless the env var is explicitly set.
+        if std::env::var("KEYOS_DEMO_VAULT").as_deref() == Ok("1") {
+            global.set_vault_demo_enabled(true);
+            let ui_weak_demo = ui_weak.clone();
+            global.on_vault_demo_inject(move || {
+                let ui = ui_weak_demo.unwrap();
+                let codes = vault::demo_payment_codes();
+                *VAULT_PARTICIPANTS.lock().unwrap() = codes.clone();
+                ui.global::<DojoSignerCallbacks>().set_vault_participants(codes.len() as i32);
+                apply_vault_build(&ui, &codes);
+                ui.global::<DojoSignerCallbacks>()
+                    .set_vault_round("🧪 DEMO: 3 fixture devices injected & vault built".into());
+            });
+
+            // DEV-ONLY: fabricate R1 pubnonces for the three fixture devices
+            // so the spend can complete on this single simulator device.
+            let ui_weak_demo_nonces = ui_weak.clone();
+            global.on_vault_demo_nonces(move || {
+                let ui = ui_weak_demo_nonces.unwrap();
+                let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                    Some(s) => s,
+                    None => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error("Start a spend session first".into());
+                        return;
+                    }
+                };
+                let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                    Some(v) => v,
+                    None => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error("Vault unavailable".into());
+                        return;
+                    }
+                };
+                let agg_xonly = match vault_cfg.agg_xonly() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Vault key: {}", e).into());
+                        return;
+                    }
+                };
+                match spend.demo_fabricate_nonces(agg_xonly) {
+                    Ok(nonces) => {
+                        let cb = ui.global::<DojoSignerCallbacks>();
+                        if let Some((pk, pubnonce)) = nonces.first() {
+                            let payload = vault::VaultQr::Nonce {
+                                pk: *pk,
+                                pubnonce: *pubnonce,
+                            }
+                            .encode();
+                            let qr = qrcode::render(
+                                payload.as_bytes(),
+                                Color::from_rgb_u8(0, 0, 0),
+                                Color::from_rgb_u8(255, 255, 255),
+                            );
+                            cb.set_vault_qr_image(qr);
+                            cb.set_show_vault_qr(true);
+                            cb.set_vault_qr_label("🧪 DEMO R1: fixture pubnonce (simulated)".into());
+                        }
+                        cb.set_vault_round(
+                            "🧪 DEMO: 3 fixture nonces fabricated — now R2: Build Session".into(),
+                        );
+                        log::info!("🏦 DEMO R1: fabricated 3 fixture pubnonces");
+                    }
+                    Err(e) => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Demo nonce failed: {}", e).into());
+                        return;
+                    }
+                }
+                *VAULT_SPEND.lock().unwrap() = Some(spend);
+            });
+
+            // DEV-ONLY: fabricate R3 partial signatures for the three fixture
+            // devices so R4 can finalize and verify on this device.
+            let ui_weak_demo_psigs = ui_weak.clone();
+            global.on_vault_demo_psigs(move || {
+                let ui = ui_weak_demo_psigs.unwrap();
+                let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                    Some(s) => s,
+                    None => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error("Start a spend session first".into());
+                        return;
+                    }
+                };
+                let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                    Some(v) => v,
+                    None => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error("Vault unavailable".into());
+                        return;
+                    }
+                };
+                let agg_xonly = match vault_cfg.agg_xonly() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Vault key: {}", e).into());
+                        return;
+                    }
+                };
+                match spend.demo_fabricate_psigs(agg_xonly) {
+                    Ok(psigs) => {
+                        let cb = ui.global::<DojoSignerCallbacks>();
+                        if let Some((pk, psig)) = psigs.first() {
+                            let payload = vault::VaultQr::Psig { pk: *pk, psig: *psig }.encode();
+                            let qr = qrcode::render(
+                                payload.as_bytes(),
+                                Color::from_rgb_u8(0, 0, 0),
+                                Color::from_rgb_u8(255, 255, 255),
+                            );
+                            cb.set_vault_qr_image(qr);
+                            cb.set_show_vault_qr(true);
+                            cb.set_vault_qr_label(
+                                "🧪 DEMO R3: fixture partial sig (simulated)".into(),
+                            );
+                        }
+                        cb.set_vault_round(
+                            "🧪 DEMO: 3 fixture partials done — tap R4: FINALIZE & VERIFY".into(),
+                        );
+                        log::info!("🏦 DEMO R3: fabricated 3 fixture partial signatures");
+                    }
+                    Err(e) => {
+                        *VAULT_SPEND.lock().unwrap() = Some(spend);
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Demo psig failed: {}", e).into());
+                        return;
+                    }
+                }
+                *VAULT_SPEND.lock().unwrap() = Some(spend);
+            });
+        }
+
+        // R0-RECEIVE: export the aggregate payment code as a QR.
+        let ui_weak_vault_qr = ui_weak.clone();
+        global.on_vault_export_vault(move || {
+            let ui = ui_weak_vault_qr.unwrap();
+            let cfg = load_app_config();
+            if cfg.vault_aggregate.is_empty() {
+                ui.global::<DojoSignerCallbacks>()
+                    .set_vault_error("Build the vault first".into());
+                return;
+            }
+            let payload = vault::VaultQr::Vault(cfg.vault_aggregate.clone()).encode();
+            let qr = qrcode::render(
+                payload.as_bytes(),
+                Color::from_rgb_u8(0, 0, 0),
+                Color::from_rgb_u8(255, 255, 255),
+            );
+            let cb = ui.global::<DojoSignerCallbacks>();
+            cb.set_vault_qr_image(qr);
+            cb.set_show_vault_qr(true);
+            cb.set_vault_qr_label("Vault payment code — senders pay this identity".into());
+            log::info!("🏦 Exported vault payment code QR");
+        });
+
+        // R0-RECEIVE: derive the next receive address from the aggregate
+        // payment code and render its QR (BIP47 child-index rotation).
+        let ui_weak_vault_recv = ui_weak.clone();
+        global.on_vault_receive_new(move || {
+            let ui = ui_weak_vault_recv.unwrap();
+            let mut cfg = load_app_config();
+            if cfg.vault_aggregate.is_empty() {
+                ui.global::<DojoSignerCallbacks>()
+                    .set_vault_error("Build the vault first".into());
+                return;
+            }
+            let idx = cfg.vault_receive_index;
+            let vcfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => match vault::VaultConfig::build(&cfg.vault_participants) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Vault unavailable: {}", e).into());
+                        return;
+                    }
+                },
+            };
+            match vcfg.receive_address(idx) {
+                Ok(addr) => {
+                    // Bump + persist BEFORE displaying so a reboot can never
+                    // re-offer this address (derivation is deterministic).
+                    cfg.vault_receive_index = idx + 1;
+                    save_app_config(&cfg);
+                    let cb = ui.global::<DojoSignerCallbacks>();
+                    cb.set_vault_receive_addr(addr.clone().into());
+                    let qr = qrcode::render(
+                        addr.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    cb.set_vault_qr_image(qr);
+                    cb.set_show_vault_qr(true);
+                    cb.set_vault_qr_label(format!("Vault receive address #{}", idx).into());
+                    log::info!("🏦 Vault receive address #{}: {}", idx, addr);
+                }
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Receive derivation failed: {}", e).into());
+                }
+            }
+        });
+
+        // R1: create a new spend session (authorization digest).
+        let ui_weak_spend = ui_weak.clone();
+        global.on_vault_new_spend(move || {
+            let ui = ui_weak_spend.unwrap();
+            let cfg = load_app_config();
+            if cfg.vault_aggregate.is_empty() {
+                ui.global::<DojoSignerCallbacks>()
+                    .set_vault_error("Build the vault first".into());
+                return;
+            }
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => match vault::VaultConfig::build(&cfg.vault_participants) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        ui.global::<DojoSignerCallbacks>()
+                            .set_vault_error(format!("Vault unavailable: {}", e).into());
+                        return;
+                    }
+                },
+            };
+            let auth = ui.global::<DojoSignerCallbacks>().get_vault_spend_msg().to_string();
+            let msg = vault::spend_message(&auth).to_vec();
+            // This device's own pubkey from its identity payment code.
+            let my_code = ui.global::<DojoSignerCallbacks>().get_vault_my_code().to_string();
+            let my_pk = match crate::bip47::PaymentCode::parse(&my_code) {
+                Ok(pc) => pc.pubkey,
+                Err(_) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Device identity unavailable".into());
+                    return;
+                }
+            };
+            *VAULT_CONFIG.lock().unwrap() = Some(vault_cfg);
+            *VAULT_SPEND.lock().unwrap() = Some(vault::VaultSpend::new(msg, 0, my_pk));
+            let cb = ui.global::<DojoSignerCallbacks>();
+            cb.set_vault_sig("".into());
+            cb.set_vault_error("".into());
+            cb.set_vault_round("R1: generate & share your nonce QR".into());
+            log::info!("🏦 New vault spend session created");
+        });
+
+        // R1: generate this device's pubnonce (TRNG + device identity key).
+        let ui_weak_nonce = ui_weak.clone();
+        global.on_vault_gen_nonce(move || {
+            let ui = ui_weak_nonce.unwrap();
+            let (rand, sk) = match (|| -> anyhow::Result<([u8; 32], SecretKey)> {
+                let rng = crate::Security::default().get_random().map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                let sk = crate::bip47::identity_secret().map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok((rng, sk))
+            })() {
+                Ok(x) => x,
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Nonce setup failed: {}", e).into());
+                    return;
+                }
+            };
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => {
+                    *VAULT_SPEND.lock().unwrap() = Some(spend);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Vault unavailable".into());
+                    return;
+                }
+            };
+            let agg_xonly = match vault_cfg.agg_xonly() {
+                Ok(x) => x,
+                Err(e) => {
+                    *VAULT_SPEND.lock().unwrap() = Some(spend);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Vault key: {}", e).into());
+                    return;
+                }
+            };
+            match spend.gen_nonce(rand, &sk, agg_xonly) {
+                Ok(pubnonce) => {
+                    let payload = vault::VaultQr::Nonce { pk: spend.my_pk, pubnonce }.encode();
+                    let qr = qrcode::render(
+                        payload.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    let cb = ui.global::<DojoSignerCallbacks>();
+                    cb.set_vault_qr_image(qr);
+                    cb.set_show_vault_qr(true);
+                    cb.set_vault_qr_label("R1: my pubnonce — coordinator scans this".into());
+                    cb.set_vault_round("R1 nonce ready — now collect the other devices' nonces".into());
+                    log::info!("🏦 R1 nonce generated");
+                }
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Nonce failed: {}", e).into())
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R1: scan another device's pubnonce QR.
+        let ui_weak_scan_nonce = ui_weak.clone();
+        global.on_vault_scan_nonce(move || {
+            let ui = ui_weak_scan_nonce.unwrap();
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            match open_scan().and_then(|t| vault::VaultQr::decode(&t).ok()) {
+                Some(vault::VaultQr::Nonce { pk, pubnonce }) => {
+                    spend.add_pubnonce(pk, pubnonce);
+                    ui.global::<DojoSignerCallbacks>().set_vault_round(
+                        format!("R1 nonce collected ({})", spend.pubnonce_count()).into(),
+                    );
+                    log::info!("🏦 R1 pubnonce scanned");
+                }
+                _ => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Not a valid nonce QR".into())
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R2 (coordinator): combine all nonces -> session, export session QR.
+        let ui_weak_session = ui_weak.clone();
+        global.on_vault_build_session(move || {
+            let ui = ui_weak_session.unwrap();
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => {
+                    *VAULT_SPEND.lock().unwrap() = Some(spend);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Vault unavailable".into());
+                    return;
+                }
+            };
+            match spend.build_session(&vault_cfg) {
+                Ok(aggnonce) => {
+                    let payload = vault::VaultQr::Session {
+                        msg: spend.msg.clone(),
+                        index: spend.index,
+                        aggnonce,
+                    }
+                    .encode();
+                    let qr = qrcode::render(
+                        payload.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    let cb = ui.global::<DojoSignerCallbacks>();
+                    cb.set_vault_qr_image(qr);
+                    cb.set_show_vault_qr(true);
+                    cb.set_vault_qr_label("R2: session — every signer scans this".into());
+                    cb.set_vault_round("R2 session ready — share it, then sign".into());
+                    log::info!("🏦 R2 session built");
+                }
+                Err(e) => {
+                    *VAULT_SPEND.lock().unwrap() = Some(spend);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Session failed: {}", e).into());
+                    return;
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R2 (signer): scan the session QR and adopt its context.
+        let ui_weak_scan_session = ui_weak.clone();
+        global.on_vault_scan_session(move || {
+            let ui = ui_weak_scan_session.unwrap();
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => {
+                    *VAULT_SPEND.lock().unwrap() = Some(spend);
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Vault unavailable".into());
+                    return;
+                }
+            };
+            match open_scan().and_then(|t| vault::VaultQr::decode(&t).ok()) {
+                Some(vault::VaultQr::Session { msg, index, aggnonce }) => {
+                    match spend.set_session(msg, index, aggnonce, &vault_cfg) {
+                        Ok(()) => {
+                            ui.global::<DojoSignerCallbacks>().set_vault_round(
+                                "R2 session imported — ready to sign".into(),
+                            );
+                            log::info!("🏦 R2 session imported");
+                        }
+                        Err(e) => {
+                            ui.global::<DojoSignerCallbacks>()
+                                .set_vault_error(format!("Session invalid: {}", e).into())
+                        }
+                    }
+                }
+                _ => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Not a valid session QR".into())
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R3: sign with this device's secnonce + identity key, export psig.
+        let ui_weak_sign = ui_weak.clone();
+        global.on_vault_sign(move || {
+            let ui = ui_weak_sign.unwrap();
+            let sk = match crate::bip47::identity_secret() {
+                Ok(sk) => sk,
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Identity key: {}", e).into());
+                    return;
+                }
+            };
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            match spend.sign_partial(&sk) {
+                Ok(psig) => {
+                    let payload = vault::VaultQr::Psig { pk: spend.my_pk, psig }.encode();
+                    let qr = qrcode::render(
+                        payload.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    let cb = ui.global::<DojoSignerCallbacks>();
+                    cb.set_vault_qr_image(qr);
+                    cb.set_show_vault_qr(true);
+                    cb.set_vault_qr_label("R3: my partial signature — coordinator scans this".into());
+                    cb.set_vault_round("R3 signed — coordinator collects all partials".into());
+                    log::info!("🏦 R3 partial signature produced");
+                }
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Sign failed: {}", e).into())
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R3: scan another device's partial signature.
+        let ui_weak_scan_psig = ui_weak.clone();
+        global.on_vault_scan_psig(move || {
+            let ui = ui_weak_scan_psig.unwrap();
+            let mut spend = match VAULT_SPEND.lock().unwrap().take() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            match open_scan().and_then(|t| vault::VaultQr::decode(&t).ok()) {
+                Some(vault::VaultQr::Psig { pk, psig }) => {
+                    spend.add_psig(pk, psig);
+                    ui.global::<DojoSignerCallbacks>().set_vault_round(
+                        format!("R3 psig collected ({})", spend.psig_count()).into(),
+                    );
+                    log::info!("🏦 R3 partial signature scanned");
+                }
+                _ => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Not a valid partial signature QR".into())
+                }
+            }
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+        });
+
+        // R4: aggregate + verify the final BIP340 signature on-device.
+        let ui_weak_finalize = ui_weak.clone();
+        global.on_vault_finalize(move || {
+            let ui = ui_weak_finalize.unwrap();
+            let spend = match VAULT_SPEND.lock().unwrap().clone() {
+                Some(s) => s,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Start a spend session first".into());
+                    return;
+                }
+            };
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error("Vault unavailable".into());
+                    return;
+                }
+            };
+            match spend.finalize(&vault_cfg) {
+                Ok(sig) => {
+                    let cb = ui.global::<DojoSignerCallbacks>();
+                    cb.set_vault_sig(hex::encode(sig).into());
+                    cb.set_vault_round("✅ VAULT SPEND SIGNATURE VERIFIED on-device".into());
+                    cb.set_show_vault_qr(false);
+                    log::info!("🏦 R4 FINAL — verified 64-byte BIP340 vault signature");
+                }
+                Err(e) => {
+                    ui.global::<DojoSignerCallbacks>()
+                        .set_vault_error(format!("Finalize failed: {}", e).into())
+                }
+            }
+        });
     }
 
     ui.run().expect("UI running");

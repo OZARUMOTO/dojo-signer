@@ -56,6 +56,21 @@ export global DojoSignerCallbacks {
     in-out property <image> receive-qr-image;
     in-out property <bool> show-receive-qr: false;
 
+    // MuSig2 Vault (3-of-3)
+    in-out property <string> vault-my-code: "";
+    in-out property <int> vault-participants: 0;
+    in-out property <string> vault-aggregate: "";
+    in-out property <string> vault-notif: "";
+    in-out property <string> vault-receive-addr: "";
+    in-out property <string> vault-spend-msg: "VAULT SPEND";
+    in-out property <string> vault-round: "";
+    in-out property <string> vault-sig: "";
+    in-out property <string> vault-error: "";
+    in-out property <image> vault-qr-image;
+    in-out property <bool> show-vault-qr: false;
+    in-out property <bool> vault-demo-enabled: false;
+    in-out property <string> vault-qr-label: "";
+
     // ============ CALLBACKS ============
     // Navigation
     callback goto-home();
@@ -66,6 +81,7 @@ export global DojoSignerCallbacks {
     callback goto-utxo();
     callback goto-coinjoin();
     callback goto-verify();
+    callback goto-vault();
 
     // Identity
     callback refresh-identity();
@@ -94,4 +110,22 @@ export global DojoSignerCallbacks {
     callback approve-coinjoin();
     callback reject-coinjoin();
     callback select-pool(string);
+
+    // MuSig2 Vault
+    callback vault-export-setup();
+    callback vault-scan-setup();
+    callback vault-build();
+    callback vault-export-vault();
+    callback vault-demo-inject();
+    callback vault-demo-nonces();
+    callback vault-demo-psigs();
+    callback vault-receive-new();
+    callback vault-new-spend();
+    callback vault-gen-nonce();
+    callback vault-scan-nonce();
+    callback vault-build-session();
+    callback vault-scan-session();
+    callback vault-sign();
+    callback vault-scan-psig();
+    callback vault-finalize();
 }

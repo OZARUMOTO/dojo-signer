@@ -102,7 +102,7 @@ pub fn derive_payment_code_payload() -> Result<[u8; 80], PayNymError> {
 }
 
 /// Base58Check-encode a payment code (version byte 0x47 → "PM8T...").
-fn encode_payment_code(payload: &[u8; 80]) -> String {
+pub(crate) fn encode_payment_code(payload: &[u8; 80]) -> String {
     let mut data = Vec::with_capacity(81);
     data.push(0x47);
     data.extend_from_slice(payload);
@@ -215,6 +215,18 @@ impl PaymentCode {
         let secp = Secp256k1::new();
         let parent = PublicKey::from_slice(&self.pubkey)
             .map_err(|_| PayNymError::InvalidPaymentCode)?;
+        let il_scalar = self.child_il(index)?;
+        parent
+            .add_exp_tweak(&secp, &il_scalar)
+            .map_err(|_| PayNymError::InvalidPaymentCode)
+    }
+
+    /// The public BIP32 child tweak IL for non-hardened child `index` (the
+    /// left 32 bytes of HMAC-SHA512). Exposed so the MuSig2 multisig receiving
+    /// path can reconstruct the shared secret without any device holding the
+    /// aggregate private key: recipients add IL·A to the summed ECDH partials,
+    /// since B' = B + s·G derivation is public.
+    pub(crate) fn child_il(&self, index: u32) -> Result<Scalar, PayNymError> {
         let mut data = Vec::with_capacity(37);
         data.extend_from_slice(&self.pubkey);
         data.extend_from_slice(&index.to_be_bytes());
@@ -223,16 +235,21 @@ impl PaymentCode {
         let i = Hmac::from_engine(engine).to_byte_array();
         let mut il = [0u8; 32];
         il.copy_from_slice(&i[..32]);
-        let il_scalar = Scalar::from_be_bytes(il)
-            .map_err(|_| PayNymError::InvalidPaymentCode)?;
-        parent
-            .add_exp_tweak(&secp, &il_scalar)
-            .map_err(|_| PayNymError::InvalidPaymentCode)
+        Scalar::from_be_bytes(il).map_err(|_| PayNymError::InvalidPaymentCode)
     }
 
     /// The BIP47 notification address (P2PKH of child index 0).
     pub fn notification_address(&self) -> Result<String, PayNymError> {
         let pk = self.child_pubkey(0)?;
+        let pkh = PubkeyHash::hash(&pk.serialize());
+        Ok(Address::p2pkh(pkh, Network::Bitcoin).to_string())
+    }
+
+    /// A BIP47 receive address: the P2PKH of child `index` of this payment
+    /// code. Deterministic per index — rotate with a counter to get fresh
+    /// addresses. Index 0 is the notification address itself.
+    pub fn receive_address(&self, index: u32) -> Result<String, PayNymError> {
+        let pk = self.child_pubkey(index)?;
         let pkh = PubkeyHash::hash(&pk.serialize());
         Ok(Address::p2pkh(pkh, Network::Bitcoin).to_string())
     }
@@ -285,6 +302,28 @@ pub fn sender_notification_secret() -> Result<SecretKey, PayNymError> {
         .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
         .map_err(|_| PayNymError::NoSeed)?;
     Ok(notification.private_key)
+}
+
+/// Derive the BIP47 identity private key from a master xprv (shared core so
+/// both the device path and the test suite exercise identical code).
+pub(crate) fn identity_secret_from_root(
+    root: &Xpriv,
+    secp: &Secp256k1<All>,
+) -> Result<SecretKey, PayNymError> {
+    let account = root
+        .derive_priv(secp, &account_path())
+        .map_err(|_| PayNymError::NoSeed)?;
+    Ok(account.private_key)
+}
+
+/// The device's BIP47 identity private key: m/47'/0'/0' (the ACCOUNT key whose
+/// public key appears in the payment code payload). This is the key the MuSig2
+/// vault signs with: the payment code pubkey IS this key's public key, so a
+/// partial signature from this device provably belongs to the vault identity.
+pub fn identity_secret() -> Result<SecretKey, PayNymError> {
+    let secp = Secp256k1::new();
+    let root = master_xpriv()?;
+    identity_secret_from_root(&root, &secp)
 }
 
 /// Notification address derived directly from a payment code payload.
@@ -411,11 +450,55 @@ mod tests {
     }
 
     #[test]
+    fn receive_address_index0_is_notification_address() {
+        let secp = Secp256k1::new();
+        let sk = secret_from_hex("0000000000000000000000000000000000000000000000000000000000000001");
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let mut payload = [0u8; 80];
+        payload[0] = 0x01; // BIP47 version 1
+        payload[2..35].copy_from_slice(&pk.serialize());
+        payload[35] = 0x42; // chaincode seed
+        let pc = PaymentCode::parse(&encode_payment_code(&payload)).unwrap();
+        // Index 0 IS the notification address per BIP47.
+        assert_eq!(pc.receive_address(0).unwrap(), pc.notification_address().unwrap());
+        // Higher indexes rotate to fresh, valid P2PKH addresses.
+        assert_ne!(pc.receive_address(1).unwrap(), pc.receive_address(2).unwrap());
+        assert!(pc.receive_address(5).unwrap().starts_with('1'));
+    }
+
+    #[test]
     fn base58check_roundtrip() {
         let data = [0x47u8, 0x01, 0x00, 0x02, 0xab, 0xcd];
         let enc = base58check_encode(&data);
         let dec = base58check_decode(&enc).unwrap();
         assert_eq!(dec, data.to_vec());
+    }
+
+    #[test]
+    fn identity_secret_pubkey_matches_payment_code_key() {
+        // The payment code payload pubkey is the m/47'/0'/0' account xpub's
+        // public key; identity_secret() must return exactly that private key.
+        let secp = Secp256k1::new();
+        let seed = [0xabu8; 64];
+        let root = Xpriv::new_master(Network::Bitcoin, &seed).unwrap();
+
+        // Payment code payload pubkey, replicating derive_payment_code_payload
+        // against a synthetic root (no device dependency in unit tests).
+        let account = root.derive_priv(&secp, &account_path()).unwrap();
+        let payload_pubkey = Xpub::from_priv(&secp, &account).public_key;
+
+        let identity = identity_secret_from_root(&root, &secp).unwrap();
+        assert_eq!(
+            PublicKey::from_secret_key(&secp, &identity),
+            payload_pubkey,
+            "identity_secret must be the private key of the payment code pubkey"
+        );
+
+        // And it is NOT the notification child key (m/47'/0'/0'/0).
+        let notification = account
+            .derive_priv(&secp, &[ChildNumber::Normal { index: 0 }])
+            .unwrap();
+        assert_ne!(identity.secret_bytes(), notification.private_key.secret_bytes());
     }
 }
 
