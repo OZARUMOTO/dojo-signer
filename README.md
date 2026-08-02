@@ -16,18 +16,16 @@ Every cryptographic derivation in this app is verified byte-for-byte against the
 
 ## 🎬 Preview
 
-**MuSig2 Vault — full 4-round spend (screen recording):**
+**MuSig2 Vault — fresh captures from the KeyOS hosted simulator:**
 
 <p align="center">
-  <img src="docs/screenshots/SPENDING.gif" width="320" alt="DOJO SIGNER — MuSig2 vault 4-round spend (nonce → session → partials → verified signature)"/>
+  <img src="docs/screenshots/homepage-to-dojoapp-to-vault.gif" width="320" alt="DOJO SIGNER — from the app home through DOJO SIGNER into the MuSig2 3-of-3 vault"/>
 </p>
-
-**Vault screenshots** (captured in the KeyOS hosted simulator):
 
 | Screen | Capture |
 |--------|---------|
-| **Home** — the new VAULT tile on the app home | <img src="docs/screenshots/HOMEPAGESHOWINGVAULTFEATURE.png" width="220" alt="Home page showing the vault feature"/> |
-| **Vault Receive** — notification address + deterministic receive address + QR from the aggregate payment code | <img src="docs/screenshots/vaultreceiveaddress.png" width="220" alt="Vault receive address"/> |
+| **Vault page** — the real 3-of-3 MuSig2 vault: device codes, build, receive + 4-round spend | <img src="docs/screenshots/realvaultpage.png" width="220" alt="The real MuSig2 vault page"/> |
+| **Receive QR** — notification + receive address with the QR from the aggregate payment code | <img src="docs/screenshots/showingreceiveQR.png" width="220" alt="Vault receive address with QR"/> |
 
 **Full app walkthrough (screen recording):**
 
@@ -151,6 +149,57 @@ Receive addresses are deterministic per BIP47 child index, so the app persists a
 #### Demo mode for the hosted simulator
 The hosted simulator is a single device, but a 3-of-3 vault needs three. Setting `KEYOS_DEMO_VAULT=1` at launch exposes a **gated "🧪 INJECT DEMO"** button on the Vault page (never reachable in a shipped build unless the env var is set). It injects three deterministic fixture payment codes so the full build → receive → spend flow can be exercised, screenshotted and filmed on one screen — including fabricated fixture signers for R1/R3 so R4 **genuinely verifies** on-device (proven by the `demo_fabricated_four_round_spend_verifies` test).
 
+---
+
+### 🔍 Why we built the vault this way (and why it had to be this way)
+
+This is the part we get asked most: *"why a QR ceremony, why three devices, why not just a normal multisig?"* Here's the full reasoning, from the threat model up.
+
+#### 1. The threat model — this is a cold-storage savings account for serious amounts
+
+The whole premise: a paranoid bitcoin maxi keeps **hundreds of thousands of dollars** in a 3-of-3 vault. That means:
+
+- **No single device can ever be enough.** If someone steals one Passport Prime, they get *nothing* — they'd need two more physical devices they don't have. This is why 3-of-3 beats 2-of-3 for this user: the attacker's win condition isn't "steal one device," it's "steal everything at once from one place."
+- **No hot wallet, ever.** The single-sig DOJO SIGNER identity is the *checking account* — small amounts, regular sends. The vault is the *savings account* — big amounts, almost never touched, and never touched by anything connected to a network.
+- **The vault key must not exist anywhere.** Not on one device, not on a server, not as a software file. It only ever exists as *three separate keys cooperating on demand*.
+
+#### 2. Why MuSig2 (BIP-327) instead of a traditional multisig?
+
+A classic 3-of-3 multisig (P2SH / P2WSH / descriptor) would work mechanically, but it leaks exactly what you're trying to hide:
+
+- **A traditional multisig is visibly different on-chain.** Its script is three public keys + `OP_CHECKMULTISIG` — an observer instantly sees "this is a shared/company/vault wallet," which makes it a target and tells the world how it's secured.
+- **MuSig2 aggregates the three keys into ONE key.** The vault gets a single public key, a single signature, a single address type — indistinguishable from an ordinary single-sig wallet. On-chain, a vault spend looks like any normal taproot spend. **Privacy win.**
+- **It keeps BIP47 working.** Because the vault is one key, it can BE a payment-code identity (`PM8T...` aggregate payment code) — ECDH, notification addresses, deterministic receive addresses all work exactly like the single-sig PayNym. A legacy multisig can't be a BIP47 payment code at all.
+- **One signature = smaller, cheaper, more private.** MuSig2 produces a single 64-byte BIP340 signature, not three.
+
+#### 3. Why QR-only 4-round ceremony?
+
+Vault devices are **air-gapped by design** — they never touch Wi-Fi, Bluetooth, or the internet. The only data channel between them is the camera and the screen:
+
+```
+R1  Nonce:   A → QR (pubnonce) → B, C
+R2  Session: B combines all nonces → aggnonce QR → A, C
+R3  Partial: each device signs → PSIG QR → coordinator
+R4  Final:   coordinator aggregates → verified 64-byte signature
+```
+
+- **The secret nonce never leaves its device.** Only the *public* nonce crosses the air gap; the BIP-327 `NonceGen` keeps the secret half in the secure element.
+- **The private key never leaves its device, ever.** Each device signs only its own partial signature with its own key; the aggregate key is never reconstructed anywhere.
+- **Every partial signature is verified before aggregation** (`partial_sig_verify`), so a corrupted or malicious QR can never poison the final signature.
+- **The final signature is verified on-device** against the vault's child key before it's ever shown — R4 is not a leap of faith.
+
+#### 4. Why the demo gate exists (`KEYOS_DEMO_VAULT=1`)
+
+The KeyOS **hosted simulator is a single device** — there's no way to connect two more Passport Primes to it. But a 3-of-3 vault requires three distinct payment codes. So the app ships with a **launch-time-gated demo helper**: only when the env var is set at launch does the Vault page show an **🧪 INJECT DEMO** button that injects three deterministic *fixture* codes (never real keys), letting the whole build → receive → spend flow run on one screen for screenshots and recordings. In any production build (env var unset) that button does not exist. This is exactly what you see in the captures above — the vault page and receive QR are **real**, generated by real BIP-327/ECDH code paths; only the *second and third device's fixture inputs* are simulated.
+
+#### 5. Why balance auto-discovery instead of manual `txid:vout`?
+
+The vault watches receive indices 0–8: for each it derives the P2TR script → Electrum scripthash → queries `blockchain.scripthash.listunspent`. On the **real device** the query is relayed over Quantum Link BLE to the companion, which talks to Electrum/Dojo **over Tor** (`ScripthashListUnspent` → `ScripthashUtxos`); in the **hosted simulator** it's a direct TCP Electrum call. This removes the manual `txid:vout:value:index` entry — the vault balance shows itself.
+
+#### 6. The honest boundary — hardware never broadcasts
+
+A hardware signer's job is to *sign*, not to *push to the network*. The vault ceremony produces a fully-signed transaction (real taproot spend with the BIP341 sighash — covered by the `real_taproot_spend_signs_and_attaches` test); **broadcasting belongs to your own node or companion app.** That's a feature: the signing path stays fully air-gapped and the broadcast path is wherever you trust your node.
+
 ### 🌀 Whirlpool Coinjoin Signing (over Quantum Link BLE)
 Real `SigningRequest` handling — the protocol types come from the actual Ashigaru source:
 
@@ -211,12 +260,14 @@ dojo-signer/
 ├── Cargo.toml              # Rust dependencies (ngwallet, quantum-link, slint-keyos-platform)
 ├── build.rs                # Slint UI compiler integration
 ├── README.md               # This file
-├── docs/screenshots/       # Simulator captures (this release's SPENDING.gif + vault PNGs)
+├── docs/screenshots/       # Simulator captures (vault walkthrough GIF + vault page + receive-QR PNGs)
 ├── src/
 │   ├── main.rs             # Entry point + app wiring (2,148 lines)
 │   ├── bip47.rs            # BIP47 payment codes, ECDH payment addresses, notification tx (504 lines)
 │   ├── musig.rs            # BIP-327 MuSig2 primitives — key agg, nonce, partial sigs (1,446 lines)
-│   ├── vault.rs            # 3-of-3 vault app layer — config, QR codec, 4-round spend (963 lines)
+│   ├── vault.rs            # 3-of-3 vault app layer — config, QR codec, 4-round spend, taproot tx (963 lines)
+│   ├── electrum.rs         # Electrum protocol client — scripthash UTXO discovery for the vault
+│   ├── cred.rs             # Encrypted-at-rest credential vault (HMAC envelope, derive-key)
 │   ├── coinjoin.rs         # Whirlpool protocol types (v0.23) + base64 helpers
 │   ├── message.rs          # BIP47 message verifier types + history
 │   └── utxo.rs             # UTXO coin control types
@@ -273,29 +324,42 @@ cd ~/KeyOS && cargo test -p gui-app-dojo-signer --profile hosted
 ```
 
 ```text
-running 29 tests
-  bip47  (8): base58check_roundtrip, blinding_mask_matches_samourai,
-              child_pubkey_matches_samourai, notification_shared_secret_matches_samourai,
-              payment_address_matches_samourai, payment_code_parse_samourai,
-              identity_secret_pubkey_matches_payment_code_key,
-              receive_address_index0_is_notification_address
-  musig (13): key_agg_matches_official_bip327_vectors, key_agg_sorted_is_order_independent,
-              key_agg_rejects_invalid_pubkeys, nonce_gen_matches_official_bip327_vectors,
-              nonce_agg_matches_official_bip327_vectors, sign_matches_official_bip327_vectors,
-              sign_with_tweaks_matches_official_vectors, sign_error_cases_match_official_vectors,
-              aggregate_payment_code_is_deterministic_and_parses,
-              threshold_ecdh_recovers_sender_side_secret,
-              recipient_recovers_payment_address_via_threshold_ecdh,
-              three_devices_jointly_sign_and_verify,
-              three_devices_sign_for_child_key_of_aggregate_payment_code
-  vault  (8): vault_build_is_order_independent_and_parses, vault_rejects_too_few_devices,
-              qr_codec_roundtrips_all_payloads, full_three_device_spend_via_qr_payloads,
-              tampered_partial_signature_fails_finalize,
-              receive_address_is_deterministic_and_rotates,
-              demo_codes_match_fixture_and_build_a_vault,
-              demo_fabricated_four_round_spend_verifies
+running 47 tests
+  bip47   (8): base58check_roundtrip, blinding_mask_matches_samourai,
+               child_pubkey_matches_samourai, notification_shared_secret_matches_samourai,
+               payment_address_matches_samourai, payment_code_parse_samourai,
+               identity_secret_pubkey_matches_payment_code_key,
+               receive_address_index0_is_notification_address
+  cred    (5): protect_roundtrips, envelope_hides_plaintext_and_key_material,
+               wrong_key_or_tamper_is_rejected, derive_key_is_deterministic_and_domain_separated,
+               hmac_matches_rfc4231_known_answer
+  electrum(6): scripthash_matches_known_answers, list_unspent_parses_canned_response,
+               list_unspent_empty_result, list_unspent_surfaces_rpc_error,
+               connection_refused_is_io_error, newline_framed_response_parses
+  musig  (13): key_agg_matches_official_bip327_vectors, key_agg_sorted_is_order_independent,
+               key_agg_rejects_invalid_pubkeys, nonce_gen_matches_official_bip327_vectors,
+               nonce_agg_matches_official_bip327_vectors, sign_matches_official_bip327_vectors,
+               sign_with_tweaks_matches_official_vectors, sign_error_cases_match_official_vectors,
+               aggregate_payment_code_is_deterministic_and_parses,
+               threshold_ecdh_recovers_sender_side_secret,
+               recipient_recovers_payment_address_via_threshold_ecdh,
+               three_devices_jointly_sign_and_verify,
+               three_devices_sign_for_child_key_of_aggregate_payment_code
+  vault  (13): vault_build_is_order_independent_and_parses, vault_rejects_too_few_devices,
+               qr_codec_roundtrips_all_payloads, full_three_device_spend_via_qr_payloads,
+               tampered_partial_signature_fails_finalize,
+               receive_address_is_deterministic_and_rotates,
+               demo_codes_match_fixture_and_build_a_vault,
+               demo_fabricated_four_round_spend_verifies,
+               real_taproot_spend_signs_and_attaches,
+               demo_taproot_send_produces_verified_signed_tx,
+               taproot_context_is_deterministic_and_parses,
+               qr_payloads_never_expose_secret_material,
+               finalized_psbt_never_exposes_secret_material
+  config  (2): config_json_never_contains_secret_key_material,
+               config_json_never_exposes_plaintext_password
 
-test result: ok. 29 passed; 0 failed
+test result: ok. 47 passed; 0 failed
 ```
 
 These tests caught real bugs before they shipped — an ECDH double-hash in the payment-address derivation, and multiple BIP-327 conformance issues (nonce-gen vector mismatches, tweak-ordering) that were fixed until the primitives matched the official vectors byte-for-byte.
@@ -387,9 +451,10 @@ os/fs             → GetUserReadAccess, GetUserWriteAccess (config + history pe
 - [x] Vault crypto verified byte-for-byte against the official `bitcoin/bips` BIP-327 vectors
 - [x] Whirlpool PSBT signing over Quantum Link BLE (real inputs/values/witnesses)
 - [x] Pool selection + node config persistence + verification history
-- [x] 29/29 unit tests (8 bip47 + 13 musig + 8 vault)
+- [x] 47/47 unit tests (8 bip47 + 5 cred + 6 electrum + 13 musig + 13 vault + 2 config)
 - [ ] Electrum `blockchain.transaction.broadcast` for live on-chain sends
-- [ ] Vault spend against a real PSBT (BIP341 sighash) instead of the authorization digest
+- [x] **Real vault spend** — full taproot transaction built on-device with the BIP341 sighash, MuSig2-signed across the 4-round ceremony, final signature verified (`real_taproot_spend_signs_and_attaches`, `demo_taproot_send_produces_verified_signed_tx`)
+- [ ] Wire the real vault spend to a connected node/companion broadcast path (hardware signer signs; node broadcasts)
 - [ ] End-to-end BLE round-trip test with the real companion app
 - [ ] Real-hardware validation on three Passport Prime dev units
 
