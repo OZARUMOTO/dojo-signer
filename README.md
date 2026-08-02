@@ -324,7 +324,7 @@ cd ~/KeyOS && cargo test -p gui-app-dojo-signer --profile hosted
 ```
 
 ```text
-running 47 tests
+running 48 tests
   bip47   (8): base58check_roundtrip, blinding_mask_matches_samourai,
                child_pubkey_matches_samourai, notification_shared_secret_matches_samourai,
                payment_address_matches_samourai, payment_code_parse_samourai,
@@ -356,10 +356,11 @@ running 47 tests
                taproot_context_is_deterministic_and_parses,
                qr_payloads_never_expose_secret_material,
                finalized_psbt_never_exposes_secret_material
-  config  (2): config_json_never_contains_secret_key_material,
-               config_json_never_exposes_plaintext_password
+  config  (3): config_json_never_contains_secret_key_material,
+               config_json_never_exposes_plaintext_password,
+               vault_balance_auto_discovery_flow
 
-test result: ok. 47 passed; 0 failed
+test result: ok. 48 passed; 0 failed
 ```
 
 These tests caught real bugs before they shipped — an ECDH double-hash in the payment-address derivation, and multiple BIP-327 conformance issues (nonce-gen vector mismatches, tweak-ordering) that were fixed until the primitives matched the official vectors byte-for-byte.
@@ -451,7 +452,7 @@ os/fs             → GetUserReadAccess, GetUserWriteAccess (config + history pe
 - [x] Vault crypto verified byte-for-byte against the official `bitcoin/bips` BIP-327 vectors
 - [x] Whirlpool PSBT signing over Quantum Link BLE (real inputs/values/witnesses)
 - [x] Pool selection + node config persistence + verification history
-- [x] 47/47 unit tests (8 bip47 + 5 cred + 6 electrum + 13 musig + 13 vault + 2 config)
+- [x] 48/48 unit tests (8 bip47 + 5 cred + 6 electrum + 13 musig + 13 vault + 3 config/integration)
 - [ ] Electrum `blockchain.transaction.broadcast` for live on-chain sends
 - [x] **Real vault spend** — full taproot transaction built on-device with the BIP341 sighash, MuSig2-signed across the 4-round ceremony, final signature verified (`real_taproot_spend_signs_and_attaches`, `demo_taproot_send_produces_verified_signed_tx`)
 - [ ] Wire the real vault spend to a connected node/companion broadcast path (hardware signer signs; node broadcasts)
