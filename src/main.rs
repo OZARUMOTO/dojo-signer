@@ -36,6 +36,8 @@ use slint_keyos_platform::{
 use std::sync::Mutex;
 
 mod bip47;
+mod cred;
+mod electrum;
 mod musig;
 mod vault;
 mod coinjoin;
@@ -63,6 +65,51 @@ static PENDING_SIGNING: Mutex<Option<SigningRequest>> = Mutex::new(None);
 static VAULT_PARTICIPANTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static VAULT_CONFIG: Mutex<Option<vault::VaultConfig>> = Mutex::new(None);
 static VAULT_SPEND: Mutex<Option<vault::VaultSpend>> = Mutex::new(None);
+static VAULT_TX: Mutex<Option<vault::VaultTx>> = Mutex::new(None);
+/// Real vault UTXOs discovered by watching the aggregate key's taproot
+/// addresses (the vault balance is tracked SEPARATELY from the single-sig
+/// home wallet — these are the multisig's own coins).
+static VAULT_UTXOS: Mutex<Vec<VaultUtxo>> = Mutex::new(Vec::new());
+/// Threshold-ECDH shares collected for a BIP47 send (R0 round), keyed by the
+/// contributing device's pubkey.
+static VAULT_ECDH_SHARES: Mutex<Vec<([u8; 33], [u8; 33])>> = Mutex::new(Vec::new());
+/// A BIP47 payment-code send awaiting its ECDH round.
+static VAULT_PENDING_SEND: Mutex<Option<VaultPendingSend>> = Mutex::new(None);
+
+/// How many BIP47 child indices of the aggregate payment code the vault
+/// balance watcher scans for real UTXOs.
+const VAULT_WATCH_DEPTH: u32 = 8;
+
+/// A real UTXO paying the vault's taproot address at a BIP47 child index.
+#[derive(Debug, Clone)]
+struct VaultUtxo {
+    txid: String,
+    vout: u32,
+    value_sats: u64,
+    index: u32,
+}
+
+/// Shared balance summary for the vault: total sats formatted as BTC when
+/// >= 1 BTC, else raw sats, plus the UTXO count. Used by BOTH the keyos
+/// (companion relay) and hosted (direct electrum) refresh paths — one source
+/// of truth so the on-device build can never diverge from the simulator.
+fn vault_balance_summary(found: &[VaultUtxo]) -> (String, i32) {
+    let total: u64 = found.iter().map(|u| u.value_sats).sum();
+    let display = if total >= 100_000_000 {
+        format!("{:.8} BTC", total as f64 / 100_000_000.0)
+    } else {
+        format!("{} sats", total)
+    };
+    (display, found.len() as i32)
+}
+
+/// A BIP47 payment-code send waiting for the threshold-ECDH R0 round.
+#[derive(Debug, Clone)]
+struct VaultPendingSend {
+    paycode: String,
+    amount_sats: u64,
+    feerate_sats_vb: u64,
+}
 
 /// Apply a built `VaultConfig` to the UI + persisted config. Shared by the
 /// BUILD VAULT button and the gated KEYOS_DEMO_VAULT demo injector so both
@@ -83,6 +130,7 @@ fn apply_vault_build(ui: &AppWindow, parts: &[String]) {
             cfg.vault_aggregate = v.aggregate_code.clone();
             save_app_config(&cfg);
             *VAULT_CONFIG.lock().unwrap() = Some(v.clone());
+            refresh_vault_balance(ui);
             cb.set_vault_round("✅ Vault built — every device computes the same code".into());
             log::info!("🏦 Vault built: {} ({})", v.aggregate_code, v.participants.len());
         }
@@ -202,7 +250,14 @@ struct AppConfig {
     port: u16,
     ssl: bool,
     username: String,
+    /// The Dojo node password. Legacy configs stored it here in plaintext;
+    /// new saves move it into `password_enc` and clear this field so
+    /// config.json never contains the plaintext credential.
     password: String,
+    /// The Dojo node password, encrypted at rest with a key derived from the
+    /// device-bound app seed (see cred.rs). Format: "v1:nonce:ct:tag".
+    #[serde(default)]
+    password_enc: String,
     receive_index: u32,
     /// Next unused BIP47 payment index per recipient payment code.
     bip47_indices: BTreeMap<String, u32>,
@@ -277,7 +332,73 @@ fn load_app_config() -> AppConfig {
     cfg
 }
 
+/// Encrypt `cfg.password` (the live UI value) into `cfg.password_enc` using a
+/// key derived from the device-bound app seed, and clear the plaintext field
+/// so config.json never contains it. Pure and deterministic — injects the
+/// key so it can be unit-tested without a running security server.
+fn protect_node_password_with_key(cfg: &mut AppConfig, app_seed: &[u8; 32], nonce: &[u8; 16]) {
+    if cfg.password.is_empty() {
+        return;
+    }
+    let key = cred::derive_key(app_seed);
+    cfg.password_enc = cred::protect(&key, nonce, cfg.password.as_bytes());
+    cfg.password.clear();
+}
+
+/// Fetch the device-bound app seed and a fresh nonce, then protect the
+/// password. If the app seed is unavailable the password is left in the
+/// legacy plaintext field so the app still works (conservative fail-open for
+/// an RPC credential, logged loudly).
+fn protect_node_password(cfg: &mut AppConfig) {
+    // FAIL CLOSED: if the device-bound key or fresh randomness is unavailable,
+    // do NOT persist the password at all (clear it, log loudly). Falling back
+    // to the legacy plaintext field would reintroduce the exact at-rest
+    // credential leak this feature exists to fix. The user re-enters the
+    // password on the next boot — same UX as a decrypt failure.
+    let app_seed = match crate::Security::default().app_seed() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("⚠️ app_seed unavailable ({e:?}) — node password NOT persisted");
+            cfg.password.clear();
+            return;
+        }
+    };
+    let mut nonce = [0u8; 16];
+    match crate::Security::default().get_random() {
+        Ok(r) => nonce.copy_from_slice(&r[..16]),
+        Err(e) => {
+            log::warn!("⚠️ get_random unavailable ({e:?}) — node password NOT persisted");
+            cfg.password.clear();
+            return;
+        }
+    }
+    protect_node_password_with_key(cfg, &app_seed, &nonce);
+}
+
+/// Decrypt the stored node password for the UI password field. Falls back to
+/// the legacy plaintext field for configs written before at-rest encryption.
+fn unlock_node_password(cfg: &AppConfig) -> String {
+    if !cfg.password_enc.is_empty() {
+        if let Ok(app_seed) = crate::Security::default().app_seed() {
+            let key = cred::derive_key(&app_seed);
+            if let Some(pw) = cred::unprotect(&key, &cfg.password_enc) {
+                return pw;
+            }
+            log::warn!("⚠️ could not decrypt stored node password");
+        }
+        String::new()
+    } else {
+        cfg.password.clone()
+    }
+}
+
 fn save_app_config(cfg: &AppConfig) {
+    // Never persist the node password in plaintext — encrypt it with the
+    // device-bound key before it touches disk (legacy plaintext `password`
+    // is migrated to `password_enc` here on the next save).
+    let mut to_save = cfg.clone();
+    protect_node_password(&mut to_save);
+
     let filesystem = crate::FileSystem::default();
     let _ = filesystem.ensure_parent_dir_exists(CONFIG_PATH, fs::Location::AppData);
     if let Ok(mut file) = filesystem.open_file(
@@ -285,7 +406,7 @@ fn save_app_config(cfg: &AppConfig) {
         fs::Location::AppData,
         fs::OpenFlags::CREATE,
     ) {
-        if let Ok(json) = serde_json::to_vec(cfg) {
+        if let Ok(json) = serde_json::to_vec(&to_save) {
             if file.write_all(&json).is_ok() {
                 let _ = file.truncate();
             }
@@ -611,8 +732,8 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             global.set_host_input(cfg.host.clone().into());
             global.set_port_input(cfg.port.to_string().into());
             global.set_ssl_input(cfg.ssl);
-            global.set_username_input(cfg.username.into());
-            global.set_password_input(cfg.password.into());
+            global.set_username_input(cfg.username.clone().into());
+            global.set_password_input(unlock_node_password(&cfg).into());
             global.set_node_status("Config loaded — connect to use".into());
             log::info!(
                 "💾 Restored node config: {}:{} (SSL={})",
@@ -635,6 +756,7 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                         Err(e) => log::warn!("⚠️ vault notif: {}", e),
                     }
                     log::info!("🏦 Restored MuSig2 vault ({} devices)", v.participants.len());
+                    refresh_vault_balance(&ui);
                 }
                 Err(e) => log::warn!("⚠️ stored vault could not be rebuilt: {}", e),
             }
@@ -761,6 +883,7 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
         global.on_refresh_balance(move || {
             let ui = ui_weak.unwrap();
             refresh_balance(&ui);
+            refresh_vault_balance(&ui);
             log::info!("💰 Balance refreshed");
         });
     }
@@ -1062,6 +1185,13 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             cfg.ssl = ssl;
             cfg.username = username.to_string();
             cfg.password = password.to_string();
+            if cfg.password.is_empty() {
+                // The user cleared the password field — drop any stored
+                // credential too, so a stale encrypted password can never
+                // come back on the next boot (protect_node_password would
+                // otherwise keep password_enc untouched on an empty save).
+                cfg.password_enc.clear();
+            }
             save_app_config(&cfg);
             log::info!("💾 Node config saved");
 
@@ -1374,6 +1504,7 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 log::info!("📥 Account update from companion: {}", update.account_id);
                 let ui = ui_weak_acct.unwrap();
                 refresh_balance(&ui);
+                refresh_vault_balance(&ui);
                 ui.global::<DojoSignerCallbacks>().set_connection_status("Companion synced".into());
                 ui.global::<DojoSignerCallbacks>().set_ble_status("Paired".into());
             }
@@ -1504,8 +1635,16 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 *VAULT_PARTICIPANTS.lock().unwrap() = codes.clone();
                 ui.global::<DojoSignerCallbacks>().set_vault_participants(codes.len() as i32);
                 apply_vault_build(&ui, &codes);
-                ui.global::<DojoSignerCallbacks>()
-                    .set_vault_round("🧪 DEMO: 3 fixture devices injected & vault built".into());
+                let cb = ui.global::<DojoSignerCallbacks>();
+                // Prefill the real-send form so the demo is one tap: a real
+                // P2TR tx paying a mainnet address from a demo vault UTXO.
+                *VAULT_TX.lock().unwrap() = None;
+                cb.set_vault_signed_tx("".into());
+                cb.set_vault_send_address("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh".into());
+                cb.set_vault_send_amount("100000".into());
+                cb.set_vault_send_feerate(4);
+                cb.set_vault_send_status("Demo vault UTXO ready (0.05 BTC) — tap ⚡ SEND".into());
+                cb.set_vault_round("🧪 DEMO: 3 fixture devices injected & vault built".into());
             });
 
             // DEV-ONLY: fabricate R1 pubnonces for the three fixture devices
@@ -1658,6 +1797,13 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             log::info!("🏦 Exported vault payment code QR");
         });
 
+        // Dismiss the floating vault QR modal (✕ or backdrop tap).
+        let ui_weak_close = ui_weak.clone();
+        global.on_vault_close_qr(move || {
+            let ui = ui_weak_close.unwrap();
+            ui.global::<DojoSignerCallbacks>().set_show_vault_qr(false);
+        });
+
         // R0-RECEIVE: derive the next receive address from the aggregate
         // payment code and render its QR (BIP47 child-index rotation).
         let ui_weak_vault_recv = ui_weak.clone();
@@ -1740,12 +1886,193 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 }
             };
             *VAULT_CONFIG.lock().unwrap() = Some(vault_cfg);
+            // Clear any previous real-taproot tx: this is an auth-digest spend,
+            // so R4 must NOT attach a signature to a stale transaction.
+            *VAULT_TX.lock().unwrap() = None;
             *VAULT_SPEND.lock().unwrap() = Some(vault::VaultSpend::new(msg, 0, my_pk));
             let cb = ui.global::<DojoSignerCallbacks>();
+            cb.set_vault_signed_tx("".into());
             cb.set_vault_sig("".into());
             cb.set_vault_error("".into());
             cb.set_vault_round("R1: generate & share your nonce QR".into());
             log::info!("🏦 New vault spend session created");
+        });
+
+        // ⚡ REAL SEND: build a P2TR transaction from a vault UTXO and sign
+        // its BIP341 key-path sighash through the 4 QR rounds. R4 attaches
+        // the 64-byte signature and emits the broadcastable signed tx.
+        let ui_weak_send = ui_weak.clone();
+        global.on_vault_send(
+            move |address: SharedString, amount_str: SharedString, feerate: i32| {
+                let ui = ui_weak_send.unwrap();
+                let cb = ui.global::<DojoSignerCallbacks>();
+                let demo = std::env::var("KEYOS_DEMO_VAULT").as_deref() == Ok("1");
+                let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                    Some(v) => v,
+                    None => {
+                        cb.set_vault_error("Build the vault first".into());
+                        return;
+                    }
+                };
+                let addr = address.to_string();
+                let amount: u64 = match amount_str.trim().parse() {
+                    Ok(a) => a,
+                    Err(_) => {
+                        cb.set_vault_error("Invalid amount (sats)".into());
+                        return;
+                    }
+                };
+                if addr.is_empty() || amount == 0 {
+                    cb.set_vault_error(
+                        "Enter a recipient (address or PM8T payment code) and amount (sats)".into(),
+                    );
+                    return;
+                }
+                let feerate = feerate.max(1) as u64;
+
+                // ---- BIP47 private send (PM8T recipient) ----
+                // The vault pays a UNIQUE per-recipient address derived via
+                // threshold-ECDH (R0): each device exports a share QR over the
+                // recipient's child pubkey; combined they recover S = a·B
+                // WITHOUT any device holding the aggregate key. The derived
+                // address is then paid like a plain taproot send.
+                if addr.trim_start().starts_with("PM8T") {
+                    let pc = match crate::bip47::PaymentCode::parse(&addr) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            cb.set_vault_error("Invalid recipient payment code (PM8T...)".into());
+                            return;
+                        }
+                    };
+                    let cfg = load_app_config();
+                    let index = cfg.bip47_indices.get(&pc.raw).copied().unwrap_or(0);
+                    let b_pub = match pc.child_pubkey(index) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            cb.set_vault_error("Recipient child derivation failed".into());
+                            return;
+                        }
+                    };
+                    let secp = Secp256k1::new();
+                    let my_code = cb.get_vault_my_code().to_string();
+                    let my_pk = match crate::bip47::PaymentCode::parse(&my_code) {
+                        Ok(p) => p.pubkey,
+                        Err(_) => {
+                            cb.set_vault_error("Device identity unavailable".into());
+                            return;
+                        }
+                    };
+                    let my_secret = match crate::bip47::identity_secret() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            cb.set_vault_error(format!("Identity key: {}", e).into());
+                            return;
+                        }
+                    };
+                    let my_share =
+                        match vault_cfg.ecdh_share(&secp, &b_pub, my_pk, &my_secret) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                cb.set_vault_error(format!("ECDH share failed: {}", e).into());
+                                return;
+                            }
+                        };
+                    *VAULT_CONFIG.lock().unwrap() = Some(vault_cfg.clone());
+                    *VAULT_PENDING_SEND.lock().unwrap() = Some(VaultPendingSend {
+                        paycode: pc.raw.clone(),
+                        amount_sats: amount,
+                        feerate_sats_vb: feerate,
+                    });
+                    *VAULT_ECDH_SHARES.lock().unwrap() = vec![(my_pk, my_share)];
+                    let payload =
+                        vault::VaultQr::Ecdh { pk: my_pk, share: my_share }.encode();
+                    let qr = qrcode::render(
+                        payload.as_bytes(),
+                        Color::from_rgb_u8(0, 0, 0),
+                        Color::from_rgb_u8(255, 255, 255),
+                    );
+                    cb.set_vault_qr_image(qr);
+                    cb.set_show_vault_qr(true);
+                    cb.set_vault_qr_label("R0-ECDH: my share — other devices scan this".into());
+                    cb.set_vault_round(
+                        "R0-ECDH: share this QR, scan the other devices' shares, then FINISH ECDH"
+                            .into(),
+                    );
+                    cb.set_vault_send_status(
+                        format!("🔒 BIP47 send to {} — ECDH round 0", &pc.raw[..14]).into(),
+                    );
+                    log::info!("🏦 BIP47 vault send: ECDH R0 opened for {}", &pc.raw[..14]);
+                    return;
+                }
+
+                // ---- Plain-address path ----
+                // Auto-pick the largest REAL discovered vault UTXO (the vault
+                // wallet watches the aggregate key's taproot addresses); the
+                // manual txid:vout:value:index field is the fallback.
+                let (txid, vout, value, index) = if demo {
+                    let (t, v, s) = vault::demo_vault_utxo();
+                    (t, v, s, 1u32)
+                } else {
+                    match pick_largest_vault_utxo(&cb) {
+                        Some(u) => (u.txid, u.vout, u.value_sats, u.index),
+                        None => {
+                            cb.set_vault_error(
+                                "No vault UTXO discovered — refresh the vault balance or enter txid:vout:value:index"
+                                    .into(),
+                            );
+                            return;
+                        }
+                    }
+                };
+                let tx = match vault::VaultTx::build(
+                    &vault_cfg, index, &addr, amount, feerate, &txid, vout, value,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cb.set_vault_error(format!("Send failed: {}", e).into());
+                        return;
+                    }
+                };
+                // This device's own pubkey from its identity payment code.
+                let my_code = cb.get_vault_my_code().to_string();
+                let my_pk = match crate::bip47::PaymentCode::parse(&my_code) {
+                    Ok(pc) => pc.pubkey,
+                    Err(_) => {
+                        cb.set_vault_error("Device identity unavailable".into());
+                        return;
+                    }
+                };
+                let spend = vault::VaultSpend::new_for_tx(&tx, my_pk);
+                *VAULT_CONFIG.lock().unwrap() = Some(vault_cfg);
+                *VAULT_TX.lock().unwrap() = Some(tx.clone());
+                *VAULT_SPEND.lock().unwrap() = Some(spend);
+                let cb = ui.global::<DojoSignerCallbacks>();
+                cb.set_vault_sig("".into());
+                cb.set_vault_error("".into());
+                cb.set_vault_signed_tx("".into());
+                cb.set_vault_send_status(
+                    format!(
+                        "⚡ Tx built: send {} sats, fee {} sats, change {} sats — R1: share your nonce QR",
+                        tx.amount_sats, tx.fee_sats, tx.change_sats
+                    )
+                    .into(),
+                );
+                cb.set_vault_round("R1: generate & share your nonce QR".into());
+                log::info!(
+                    "🏦 Real taproot send: {} sats to {} (fee {}, change {})",
+                    tx.amount_sats,
+                    tx.recipient,
+                    tx.fee_sats,
+                    tx.change_sats
+                );
+            },
+        );
+
+        // Fee selector: remember the chosen sats/vB for the next SEND.
+        let ui_weak_feerate = ui_weak.clone();
+        global.on_vault_pick_feerate(move |rate: i32| {
+            let ui = ui_weak_feerate.unwrap();
+            ui.global::<DojoSignerCallbacks>().set_vault_send_feerate(rate);
         });
 
         // R1: generate this device's pubnonce (TRNG + device identity key).
@@ -2031,7 +2358,28 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 Ok(sig) => {
                     let cb = ui.global::<DojoSignerCallbacks>();
                     cb.set_vault_sig(hex::encode(sig).into());
-                    cb.set_vault_round("✅ VAULT SPEND SIGNATURE VERIFIED on-device".into());
+                    if let Some(tx) = VAULT_TX.lock().unwrap().clone() {
+                        match tx.attach_signature(sig) {
+                            Ok(hex_tx) => {
+                                cb.set_vault_signed_tx(hex_tx.into());
+                                let demo =
+                                    std::env::var("KEYOS_DEMO_VAULT").as_deref() == Ok("1");
+                                cb.set_vault_round(
+                                    if demo {
+                                        "✅ SIG VERIFIED — DEMO signed tx (swap in a real UTXO to broadcast)"
+                                    } else {
+                                        "✅ VAULT SPEND SIGNATURE VERIFIED — SIGNED TX READY TO BROADCAST"
+                                    }
+                                    .into(),
+                                );
+                            }
+                            Err(e) => {
+                                cb.set_vault_error(format!("Signed tx failed: {}", e).into())
+                            }
+                        }
+                    } else {
+                        cb.set_vault_round("✅ VAULT SPEND SIGNATURE VERIFIED on-device".into());
+                    }
                     cb.set_show_vault_qr(false);
                     log::info!("🏦 R4 FINAL — verified 64-byte BIP340 vault signature");
                 }
@@ -2040,6 +2388,250 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                         .set_vault_error(format!("Finalize failed: {}", e).into())
                 }
             }
+        });
+
+        // 🔄 Refresh the vault balance: real UTXO discovery over the vault's
+        // taproot addresses (separate from the single-sig home wallet).
+        let ui_weak_vref = ui_weak.clone();
+        global.on_vault_refresh_balance(move || {
+            let ui = ui_weak_vref.unwrap();
+            refresh_vault_balance(&ui);
+            log::info!("🔄 Vault balance refreshed");
+        });
+
+        // R0-ECDH: scan another device's share for the pending BIP47 send.
+        let ui_weak_ecdh_scan = ui_weak.clone();
+        global.on_vault_scan_ecdh(move || {
+            let ui = ui_weak_ecdh_scan.unwrap();
+            let cb = ui.global::<DojoSignerCallbacks>();
+            let mut shares = VAULT_ECDH_SHARES.lock().unwrap().clone();
+            match open_scan().and_then(|t| vault::VaultQr::decode(&t).ok()) {
+                Some(vault::VaultQr::Ecdh { pk, share }) => {
+                    if !shares.iter().any(|(p, _)| *p == pk) {
+                        shares.push((pk, share));
+                        *VAULT_ECDH_SHARES.lock().unwrap() = shares.clone();
+                    }
+                    let need = VAULT_CONFIG
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|c| c.participants.len())
+                        .unwrap_or(0);
+                    cb.set_vault_round(
+                        format!(
+                            "R0-ECDH shares {}/{} — FINISH to derive the address",
+                            shares.len(),
+                            need
+                        )
+                        .into(),
+                    );
+                    log::info!("🏦 R0-ECDH share scanned ({}/{})", shares.len(), need);
+                }
+                _ => {
+                    cb.set_vault_error("Not a valid ECDH share QR".into());
+                }
+            }
+        });
+
+        // R0-ECDH FINISH: combine all shares → shared secret → the unique
+        // BIP47 payment address, fund the first-contact notification from the
+        // single-sig wallet, then build the real taproot tx to the derived
+        // address and start the 4-round ceremony.
+        let ui_weak_ecdh_fin = ui_weak.clone();
+        global.on_vault_ecdh_finish(move || {
+            let ui = ui_weak_ecdh_fin.unwrap();
+            let cb = ui.global::<DojoSignerCallbacks>();
+            let vault_cfg = match VAULT_CONFIG.lock().unwrap().clone() {
+                Some(v) => v,
+                None => {
+                    cb.set_vault_error("Build the vault first".into());
+                    return;
+                }
+            };
+            let pending = match VAULT_PENDING_SEND.lock().unwrap().take() {
+                Some(p) => p,
+                None => {
+                    cb.set_vault_error("Start a PM8T send first (R0)".into());
+                    return;
+                }
+            };
+            let shares = std::mem::take(&mut *VAULT_ECDH_SHARES.lock().unwrap());
+            if shares.len() < vault_cfg.participants.len() {
+                cb.set_vault_error(format!(
+                    "Need {} ECDH shares, have {}",
+                    vault_cfg.participants.len(),
+                    shares.len()
+                )
+                .into());
+                return;
+            }
+            // Combine this device's + scanned shares into S = a·B (x-coord).
+            let share_bytes: Vec<[u8; 33]> = shares.iter().map(|(_, s)| *s).collect();
+            let shared_x = match vault_cfg.combine_ecdh_shares(&share_bytes) {
+                Ok(x) => x,
+                Err(e) => {
+                    cb.set_vault_error(format!("ECDH combine failed: {}", e).into());
+                    return;
+                }
+            };
+            let pc = match crate::bip47::PaymentCode::parse(&pending.paycode) {
+                Ok(p) => p,
+                Err(_) => {
+                    cb.set_vault_error("Invalid recipient payment code".into());
+                    return;
+                }
+            };
+            let mut cfg = load_app_config();
+            let index = cfg.bip47_indices.get(&pc.raw).copied().unwrap_or(0);
+            let (pay_addr, used_index) =
+                match pc.payment_address_from_shared_x(shared_x, index) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        cb.set_vault_error(format!("Payment address: {}", e).into());
+                        return;
+                    }
+                };
+            cfg.bip47_indices.insert(pc.raw.clone(), used_index + 1);
+            save_app_config(&cfg);
+            cb.set_vault_send_status(format!("🔒 BIP47 address derived: {}", pay_addr).into());
+
+            // First-contact notification: funded by the single-sig wallet,
+            // carrying the vault's AGGREGATE payment code (blinded).
+            let pc_notif = pc.clone();
+            let vcfg_notif = vault_cfg.clone();
+            let ui_notif = ui.as_weak();
+            spawn_local(async move {
+                let Some(ui) = ui_notif.upgrade() else { return; };
+                let cb = ui.global::<DojoSignerCallbacks>();
+                match build_vault_notification_psbt(&pc_notif, &vcfg_notif) {
+                    Ok(Some((psbt, _outpoint))) => {
+                        let txid = psbt.unsigned_tx.compute_txid().to_string();
+                        match broadcast_psbt(psbt).await {
+                            Ok(_) => cb.set_vault_send_status(
+                                format!("📡 BIP47 notification sent (tx {})", &txid[..10]).into(),
+                            ),
+                            Err(_) => cb.set_vault_send_status(
+                                "⏳ notification PSBT ready — broadcast via companion".into(),
+                            ),
+                        }
+                    }
+                    Ok(None) => cb.set_vault_send_status(
+                        "⚠️ no single-sig UTXO to fund the notification — first contact skipped"
+                            .into(),
+                    ),
+                    Err(e) => {
+                        cb.set_vault_send_status(format!("⚠️ notification: {}", e).into())
+                    }
+                }
+            }).detach();
+
+            // Build the real taproot tx to the DERIVED address, auto-picking
+            // the largest discovered vault UTXO, then run the 4-round ceremony.
+            let (txid, vout, value, tx_index) =
+                if std::env::var("KEYOS_DEMO_VAULT").as_deref() == Ok("1") {
+                    let (t, v, s) = vault::demo_vault_utxo();
+                    (t, v, s, 1u32)
+                } else {
+                    match pick_largest_vault_utxo(&cb) {
+                        Some(u) => (u.txid, u.vout, u.value_sats, u.index),
+                        None => {
+                            cb.set_vault_error("No vault UTXO discovered to fund the send".into());
+                            return;
+                        }
+                    }
+                };
+            let tx = match vault::VaultTx::build(
+                &vault_cfg,
+                tx_index,
+                &pay_addr,
+                pending.amount_sats,
+                pending.feerate_sats_vb,
+                &txid,
+                vout,
+                value,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    cb.set_vault_error(format!("Send failed: {}", e).into());
+                    return;
+                }
+            };
+            let my_code = cb.get_vault_my_code().to_string();
+            let my_pk = match crate::bip47::PaymentCode::parse(&my_code) {
+                Ok(p) => p.pubkey,
+                Err(_) => {
+                    cb.set_vault_error("Device identity unavailable".into());
+                    return;
+                }
+            };
+            let spend = vault::VaultSpend::new_for_tx(&tx, my_pk);
+            *VAULT_CONFIG.lock().unwrap() = Some(vault_cfg);
+            *VAULT_TX.lock().unwrap() = Some(tx.clone());
+            *VAULT_SPEND.lock().unwrap() = Some(spend);
+            cb.set_vault_sig("".into());
+            cb.set_vault_error("".into());
+            cb.set_vault_signed_tx("".into());
+            cb.set_vault_send_status(
+                format!(
+                    "⚡ BIP47 send: {} sats to {} (fee {}, change {}) — R1: share your nonce QR",
+                    tx.amount_sats, pay_addr, tx.fee_sats, tx.change_sats
+                )
+                .into(),
+            );
+            cb.set_vault_round("R1: generate & share your nonce QR".into());
+            log::info!("🏦 BIP47 vault send to derived address — ceremony started");
+        });
+
+        // 📡 Broadcast the finalized signed tx via quantum-link (real).
+        let ui_weak_bcast = ui_weak.clone();
+        global.on_vault_broadcast(move || {
+            let ui = ui_weak_bcast.unwrap();
+            let cb = ui.global::<DojoSignerCallbacks>();
+            let tx = match VAULT_TX.lock().unwrap().clone() {
+                Some(t) => t,
+                None => {
+                    cb.set_vault_error("Finalize the spend first (R4)".into());
+                    return;
+                }
+            };
+            let sig_hex = cb.get_vault_sig().to_string();
+            let sig = match hex::decode(&sig_hex) {
+                Ok(b) if b.len() == 64 => {
+                    let mut s = [0u8; 64];
+                    s.copy_from_slice(&b);
+                    s
+                }
+                _ => {
+                    cb.set_vault_error("No verified signature to broadcast".into());
+                    return;
+                }
+            };
+            let psbt_bytes = match tx.to_finalized_psbt(sig) {
+                Ok(b) => b,
+                Err(e) => {
+                    cb.set_vault_error(format!("Finalized PSBT failed: {}", e).into());
+                    return;
+                }
+            };
+            let ui_bcast = ui.as_weak();
+            spawn_local(async move {
+                let Some(ui) = ui_bcast.upgrade() else { return; };
+                let cb = ui.global::<DojoSignerCallbacks>();
+                match ngwallet::bdk_wallet::bitcoin::Psbt::deserialize(&psbt_bytes) {
+                    Ok(psbt) => {
+                        let txid = psbt.unsigned_tx.compute_txid().to_string();
+                        match broadcast_psbt(psbt).await {
+                            Ok(_) => cb.set_vault_send_status(
+                                format!("📡 VAULT SPEND BROADCAST — txid {}", &txid[..16]).into(),
+                            ),
+                            Err(e) => {
+                                cb.set_vault_error(format!("Broadcast failed: {}", e).into())
+                            }
+                        }
+                    }
+                    Err(e) => cb.set_vault_error(format!("PSBT parse failed: {}", e).into()),
+                }
+            }).detach();
         });
     }
 
@@ -2145,4 +2737,487 @@ fn refresh_balance(ui: &AppWindow) {
         avg_anonset: review.summary.avg_anonset as i32,
     };
     ui.global::<DojoSignerCallbacks>().set_utxo_summary(view);
+}
+
+// =====================================================================
+// VAULT WALLET — REAL BALANCE + UTXO DISCOVERY
+//
+// The vault is a SEPARATE wallet from the single-sig home wallet. Every vault
+// receive address derives deterministically from the aggregate key's taproot
+// context, so we build a bdk wallet per derived address with a tr() descriptor
+// and let the normal sync/list_unspent machinery surface the multisig's own
+// coins — the vault balance is discovered for real, never fabricated.
+// =====================================================================
+
+/// Create a bdk wallet watching the vault's taproot address at BIP47 child
+/// `index` (the tr() descriptor of the aggregate key). Same machinery as the
+/// single-sig home wallet, so companion/electrum sync flows in identically.
+#[allow(dead_code)] // kept: descriptor-based wallet builder (PSBT signing path)
+fn create_vault_wallet(
+    vcfg: &vault::VaultConfig,
+    index: u32,
+) -> anyhow::Result<NgWallet<NullPersister>> {
+    let descriptor = vcfg.tr_descriptor(index)?;
+    let persister = Arc::new(Mutex::new(NullPersister(Mutex::new(
+        ngwallet::bdk_wallet::ChangeSet::default(),
+    ))));
+    let wallet = NgWallet::new_from_descriptor(
+        descriptor.clone(),
+        Some(descriptor),
+        Network::Bitcoin,
+        Arc::new(SimpleMetaStorage),
+        persister,
+    )?;
+    Ok(wallet)
+}
+
+/// Discover the vault's REAL balance from the connected Dojo's Electrum
+/// server (plain TCP 50001): for every derived taproot receive address (BIP47
+/// child indices 0..=VAULT_WATCH_DEPTH) compute its P2TR script, look up the
+/// Electrum scripthash, and collect every unspent output into VAULT_UTXOS.
+/// Runs on a background thread so the socket never blocks the UI; results are
+/// marshalled back via invoke_from_event_loop.
+///
+/// Falls back gracefully: no node configured, an SSL endpoint (the zero-dep
+/// client is plain-TCP only), or an unreachable server → the vault keeps its
+/// current balance and the manual txid:vout entry (pick_largest_vault_utxo)
+/// still works.
+fn refresh_vault_balance(ui: &AppWindow) {
+    let vcfg = match VAULT_CONFIG.lock().unwrap().clone() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // DEV-ONLY (KEYOS_DEMO_VAULT=1): show the fixture UTXO so the demo
+    // screenshots display a realistic balance without a real node.
+    if std::env::var("KEYOS_DEMO_VAULT").as_deref() == Ok("1") {
+        let (txid, vout, value) = vault::demo_vault_utxo();
+        let found = vec![VaultUtxo {
+            txid,
+            vout,
+            value_sats: value,
+            index: 1,
+        }];
+        *VAULT_UTXOS.lock().unwrap() = found.clone();
+        let total: u64 = found.iter().map(|u| u.value_sats).sum();
+        let display = if total >= 100_000_000 {
+            format!("{:.8} BTC", total as f64 / 100_000_000.0)
+        } else {
+            format!("{} sats", total)
+        };
+        log::info!("🏦 Vault balance (demo): {} across {} UTXO(s)", display, found.len());
+        ui.global::<DojoSignerCallbacks>().set_vault_balance_display(display.into());
+        ui.global::<DojoSignerCallbacks>().set_vault_utxo_count(found.len() as i32);
+        return;
+    }
+
+    // REAL DEVICE (keyos): the device never talks to the node directly — relay
+    // each BIP47 child-index scripthash to the companion over Quantum Link,
+    // which queries Electrum/Dojo over Tor and replies with ScripthashUtxos.
+    // Scans are SERIALIZED per index: we await each reply before sending the
+    // next, so a slow Tor round-trip never stacks N concurrent relays (each
+    // relay carries its own 30s timeout on the device side).
+    #[cfg(keyos)]
+    {
+        let ui_weak = ui.as_weak();
+        spawn_local(async move {
+            let mut found: Vec<VaultUtxo> = Vec::new();
+            for index in 0..=VAULT_WATCH_DEPTH {
+                let q = match vcfg.taproot_context(index) {
+                    Ok((_, _, q)) => q,
+                    Err(e) => {
+                        log::debug!("🏦 taproot #{} unavailable: {}", index, e);
+                        continue;
+                    }
+                };
+                let script = vault::p2tr_script(&q);
+                let sh = electrum::scripthash_hex(script.as_bytes());
+                let request = quantum_link::messages::ScripthashListUnspent {
+                    scripthash: sh,
+                };
+                match async_archive::<quantum_link_permissions::QuantumLinkPermissions, _>(
+                    request,
+                )
+                .await
+                {
+                    Ok(reply) => {
+                        for u in reply.utxos {
+                            found.push(VaultUtxo {
+                                txid: u.tx_hash,
+                                vout: u.tx_pos,
+                                value_sats: u.value_sats,
+                                index,
+                            });
+                        }
+                    }
+                    Err(e) => log::debug!("🏦 QL scripthash #{}: {:?}", index, e),
+                }
+            }
+            *VAULT_UTXOS.lock().unwrap() = found.clone();
+            let (display, count) = vault_balance_summary(&found);
+            log::info!("🏦 Vault balance: {} across {} UTXO(s)", display, found.len());
+            let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.global::<DojoSignerCallbacks>().set_vault_balance_display(display.into());
+                    ui.global::<DojoSignerCallbacks>().set_vault_utxo_count(count);
+                }
+            });
+        })
+        .detach();
+        return;
+    }
+
+    // HOSTED SIMULATOR (not keyos): the simulator reaches the configured node
+    // directly over plain-TCP Electrum — no companion relay involved.
+    #[cfg(not(keyos))]
+    {
+        let cfg = load_app_config();
+        let host = cfg.host.clone();
+        let port = cfg.port;
+        let ssl = cfg.ssl;
+        if host.is_empty() {
+            log::info!("🏦 No node configured — vault balance auto-discovery skipped (manual txid:vout still works)");
+            clear_vault_utxos(ui);
+            return;
+        }
+        if ssl {
+            // Zero-dependency client is plain TCP only; TLS would need a client
+            // crate the offline build doesn't have. Honest fallback to manual.
+            log::warn!("🏦 SSL Electrum endpoint configured — auto-discovery needs plain TCP (50001); using manual txid:vout instead");
+            clear_vault_utxos(ui);
+            return;
+        }
+
+        let ui_weak = ui.as_weak();
+        std::thread::spawn(move || {
+            let mut found: Vec<VaultUtxo> = Vec::new();
+            for index in 0..=VAULT_WATCH_DEPTH {
+                let q = match vcfg.taproot_context(index) {
+                    Ok((_, _, q)) => q,
+                    Err(e) => {
+                        log::debug!("🏦 taproot #{} unavailable: {}", index, e);
+                        continue;
+                    }
+                };
+                let script = vault::p2tr_script(&q);
+                let sh = electrum::scripthash_hex(script.as_bytes());
+                match electrum::list_unspent(&host, port, &sh) {
+                    Ok(utxos) => {
+                        for u in utxos {
+                            found.push(VaultUtxo {
+                                txid: u.tx_hash,
+                                vout: u.tx_pos,
+                                value_sats: u.value_sats,
+                                index,
+                            });
+                        }
+                    }
+                    Err(e) => log::debug!("🏦 electrum #{}: {}", index, e),
+                }
+            }
+            *VAULT_UTXOS.lock().unwrap() = found.clone();
+            let (display, count) = vault_balance_summary(&found);
+            log::info!("🏦 Vault balance: {} across {} UTXO(s)", display, found.len());
+            let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.global::<DojoSignerCallbacks>().set_vault_balance_display(display.into());
+                    ui.global::<DojoSignerCallbacks>().set_vault_utxo_count(count);
+                }
+            });
+        });
+    }
+}
+
+/// Reset the discovered vault UTXO set and balance display to zero. Used when
+/// auto-discovery can't run (no node configured, SSL endpoint, unreachable
+/// server) so a STALE balance/UTXO set from a previous refresh can never be
+/// shown or auto-picked for a send.
+fn clear_vault_utxos(ui: &AppWindow) {
+    *VAULT_UTXOS.lock().unwrap() = Vec::new();
+    ui.global::<DojoSignerCallbacks>().set_vault_balance_display("0 sats".into());
+    ui.global::<DojoSignerCallbacks>().set_vault_utxo_count(0);
+}
+
+/// Pick the largest REAL discovered vault UTXO for an auto-picked send,
+/// falling back to the manual txid:vout:value:index field.
+fn pick_largest_vault_utxo(cb: &DojoSignerCallbacks) -> Option<VaultUtxo> {
+    let found = VAULT_UTXOS.lock().unwrap().clone();
+    if let Some(big) = found.iter().max_by_key(|u| u.value_sats) {
+        return Some(big.clone());
+    }
+    // Fallback: manual txid:vout:value[:index]
+    let raw = cb.get_vault_send_utxo().to_string();
+    let parts: Vec<&str> = raw.trim().split(':').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let vout: u32 = parts.get(1)?.parse().ok()?;
+    let value: u64 = parts.get(2)?.parse().ok()?;
+    let index: u32 = parts.get(3).and_then(|p| p.parse().ok()).unwrap_or(1);
+    Some(VaultUtxo {
+        txid: parts[0].to_string(),
+        vout,
+        value_sats: value,
+        index,
+    })
+}
+
+/// BIP47 first-contact notification for a VAULT send: funded by the single-sig
+/// wallet (the "cold wallet pays the intro fee" design), carrying the vault's
+/// AGGREGATE payment code blinded by HMAC-SHA512(outpoint, x). The recipient
+/// unblinds it with its own key, learns the vault's code, and can derive the
+/// same payment address — private, never exposing any single device's key.
+fn build_vault_notification_psbt(
+    pc: &bip47::PaymentCode,
+    vcfg: &vault::VaultConfig,
+) -> anyhow::Result<
+    Option<(
+        ngwallet::bdk_wallet::bitcoin::Psbt,
+        ngwallet::bdk_wallet::bitcoin::OutPoint,
+    )>,
+> {
+    use ngwallet::bdk_wallet::bitcoin::{
+        bip32::{ChildNumber, Xpriv},
+        consensus,
+        hashes::{
+            hmac::{Hmac, HmacEngine},
+            sha512, Hash, HashEngine,
+        },
+        script::PushBytesBuf,
+        secp256k1::Secp256k1,
+        Amount, FeeRate, Network,
+    };
+    use std::str::FromStr;
+
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+
+    // Designated input: the first unspent single-sig UTXO (its outpoint
+    // drives the blinding, exactly like the single-sig notification path).
+    let utxo = {
+        let bdk = wallet
+            .bdk_wallet
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        let utxo = bdk.list_unspent().next();
+        utxo
+    };
+    let Some(utxo) = utxo else {
+        return Ok(None);
+    };
+
+    let secp = Secp256k1::new();
+    let master = load_master_key(Network::Bitcoin)?;
+    let internal = utxo.keychain == KeychainKind::Internal;
+    let path = [
+        ChildNumber::from_hardened_idx(84)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(if internal { 1 } else { 0 })?,
+        ChildNumber::Normal {
+            index: utxo.derivation_index,
+        },
+    ];
+    let root = Xpriv::new_master(Network::Bitcoin, &master.key.0)
+        .map_err(|e| anyhow::anyhow!("xpriv: {}", e))?;
+    let input_secret = root.derive_priv(&secp, &path)?.private_key;
+
+    // Shared secret with the recipient's notification key: S = a·B (raw x).
+    let b_pub = pc.child_pubkey(0)?;
+    let x = bip47::ecdh_x_coordinate(&secp, &b_pub, &input_secret)?;
+
+    // Blinding factor: s = HMAC-SHA512(outpoint, x) of the designated input.
+    let outpoint_bytes = consensus::serialize(&utxo.outpoint);
+    let mut engine = HmacEngine::<sha512::Hash>::new(&outpoint_bytes);
+    engine.input(&x);
+    let mask = Hmac::from_engine(engine).to_byte_array();
+
+    // Blind the vault's AGGREGATE payment code (payload_from_code), not the
+    // device's own code — the notification announces the vault identity.
+    let payload = bip47::payload_from_code(&vcfg.payment_code()?);
+    let mut blinded = [0u8; 80];
+    blinded[..3].copy_from_slice(&payload[..3]);
+    for i in 0..32 {
+        blinded[3 + i] = payload[3 + i] ^ mask[i];
+    }
+    for i in 0..32 {
+        blinded[35 + i] = payload[35 + i] ^ mask[32 + i];
+    }
+    blinded[67..].copy_from_slice(&payload[67..]);
+
+    // OP_RETURN with the blinded aggregate code + dust to the recipient's
+    // notification address.
+    let notif_addr = ngwallet::bdk_wallet::bitcoin::Address::from_str(
+        &pc.notification_address().map_err(|e| anyhow::anyhow!("{}", e))?,
+    )
+    .map_err(|e| anyhow::anyhow!("notif addr: {}", e))?
+    .require_network(Network::Bitcoin)
+    .map_err(|_| anyhow::anyhow!("wrong network"))?;
+
+    let mut op_return = PushBytesBuf::new();
+    op_return.extend_from_slice(&blinded)?;
+
+    let fee_rate = FeeRate::from_sat_per_vb(4).ok_or_else(|| anyhow::anyhow!("bad fee"))?;
+    let dust = Amount::from_sat(1000);
+
+    let mut tx_builder = wallet
+        .bdk_wallet
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+    let mut builder = tx_builder.build_tx();
+    builder.add_recipient(notif_addr.script_pubkey(), dust);
+    builder.add_data(&op_return);
+    builder.add_utxo(utxo.outpoint)?;
+    builder.fee_rate(fee_rate);
+    let mut psbt = builder.finish().map_err(|e| anyhow::anyhow!("Build: {}", e))?;
+
+    if psbt.unsigned_tx.input.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "notification tx must have exactly 1 input (UTXO too small for fee + outputs)"
+        ));
+    }
+
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    tx_builder
+        .sign(&mut psbt, options)
+        .map_err(|e| anyhow::anyhow!("Sign: {}", e))?;
+    drop(tx_builder);
+    Ok(Some((psbt, utxo.outpoint)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_json_never_exposes_plaintext_password() {
+        // The audit guarantee: config.json must never contain the node
+        // password in plaintext. protect_node_password_with_key is the exact
+        // path save_app_config runs (minus the security-server fetch), so
+        // this guards the serialization boundary itself.
+        let mut cfg = AppConfig::default();
+        cfg.host = "localhost".into();
+        cfg.port = 50002;
+        cfg.ssl = true;
+        cfg.username = "admin".into();
+        cfg.password = "hunter2-node-password".into();
+
+        let app_seed = [0x5Au8; 32];
+        let nonce = [0x3Cu8; 16];
+        protect_node_password_with_key(&mut cfg, &app_seed, &nonce);
+
+        // The plaintext is gone from the struct...
+        assert!(cfg.password.is_empty());
+        assert!(cfg.password_enc.starts_with("v1:"));
+
+        // ...and from the serialized JSON that lands in config.json.
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(!json.contains("hunter2-node-password"), "plaintext leaked into config JSON");
+        assert!(!json.contains("hunter2"), "partial plaintext leaked");
+
+        // Round-trips back through the real decryption path.
+        let key = cred::derive_key(&app_seed);
+        assert_eq!(
+            cred::unprotect(&key, &cfg.password_enc).unwrap(),
+            "hunter2-node-password"
+        );
+    }
+
+    #[test]
+    fn config_json_never_contains_secret_key_material() {
+        // Even a maximal config (vault participants + aggregate code) must not
+        // serialize any private-key-shaped material. AppConfig holds only
+        // public data — payment codes, addresses, counters — never secrets.
+        let cfg = AppConfig {
+            host: "localhost".into(),
+            port: 50002,
+            ssl: true,
+            username: "admin".into(),
+            password_enc: "v1:00000000000000000000000000000000:00:00".into(),
+            vault_participants: vec![vault::demo_payment_codes()[0].clone()],
+            vault_aggregate: "PM8TJ2JxQ5ztXUpBBRnpTbcUXbUHy2T1abfrb3KkAAtMEGNbey4oumH7Hc578WgQJhPjBxteQ5GHHToTYHE3A1w6p7tU6KSoFmWBVbFGjKPisZDbP97".into(),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        for forbidden in ["seed", "xprv", "tprv", "mnemonic", "secret"] {
+            assert!(!json.to_lowercase().contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn vault_balance_auto_discovery_flow() {
+        // The hosted auto-discovery path, end to end minus a real node:
+        //   1. every watch index derives a DISTINCT scripthash — a collision
+        //      would double-count a UTXO found under two indices;
+        //   2. a real electrum query against a canned local server parses
+        //      into the VaultUtxo set exactly as refresh_vault_balance maps it;
+        //   3. the shared summary helper aggregates the balance display.
+        let codes = vault::demo_payment_codes();
+        let vcfg = vault::VaultConfig::build(&codes).unwrap();
+
+        // (1) Distinct scripthashes across the full watch depth.
+        let mut shs: Vec<String> = Vec::new();
+        for index in 0..=VAULT_WATCH_DEPTH {
+            let (_, _, q) = vcfg.taproot_context(index).unwrap();
+            let script = vault::p2tr_script(&q);
+            let sh = electrum::scripthash_hex(script.as_bytes());
+            assert_eq!(sh.len(), 64, "scripthash must be 64 hex chars");
+            assert!(
+                !shs.contains(&sh),
+                "index {index} collides with a previous scripthash — auto-discovery would double-count"
+            );
+            shs.push(sh);
+        }
+        assert_eq!(shs.len(), (VAULT_WATCH_DEPTH + 1) as usize);
+
+        // (2) Canned electrum server answering the REAL scripthash query with
+        //     one 0.05 BTC UTXO — mirrors electrum::tests::canned_server_crlf.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let want_sh = shs[0].clone();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = String::new();
+            let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
+            std::io::BufRead::read_line(&mut reader, &mut req).unwrap();
+            assert!(
+                req.contains(want_sh.as_str()),
+                "query must target the derived scripthash: {req}"
+            );
+            let body = format!(
+                r#"{{"id":1,"result":[{{"height":840000,"tx_hash":"aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899","tx_pos":0,"value":5000000}}],"error":null}}"#
+            );
+            let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            std::io::Write::write_all(&mut sock, framed.as_bytes()).unwrap();
+        });
+
+        let utxos = electrum::list_unspent("127.0.0.1", port, &shs[0]).unwrap();
+        handle.join().unwrap();
+
+        let found: Vec<VaultUtxo> = utxos
+            .iter()
+            .map(|u| VaultUtxo {
+                txid: u.tx_hash.clone(),
+                vout: u.tx_pos,
+                value_sats: u.value_sats,
+                index: 0,
+            })
+            .collect();
+
+        // (3) The exact summary both refresh_vault_balance branches use.
+        let (display, count) = vault_balance_summary(&found);
+        assert_eq!(display, "5000000 sats");
+        assert_eq!(count, 1);
+
+        // 1 BTC+ switches to BTC formatting.
+        let big: Vec<VaultUtxo> = vec![VaultUtxo {
+            txid: "aa".into(),
+            vout: 0,
+            value_sats: 150_000_000,
+            index: 0,
+        }];
+        assert_eq!(vault_balance_summary(&big).0, "1.50000000 BTC");
+    }
 }

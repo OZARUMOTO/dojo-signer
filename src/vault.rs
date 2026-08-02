@@ -28,9 +28,14 @@
 
 use core::fmt;
 
+use std::str::FromStr;
+
 use ngwallet::bdk_wallet::bitcoin::{
-    hashes::{sha256, Hash},
-    secp256k1::{schnorr, Message, PublicKey, Scalar, Secp256k1, SecretKey},
+    hashes::{sha256, Hash, HashEngine},
+    secp256k1::{schnorr, All, Message, Parity, PublicKey, Scalar, Secp256k1, SecretKey, XOnlyPublicKey},
+    sighash::{Prevouts, SighashCache, TapSighashType},
+    transaction, Address, Amount, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Txid, Witness, absolute, consensus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +64,14 @@ pub enum VaultError {
     NeedMoreSigners(&'static str),
     /// The final signature failed verification (a signer was wrong).
     SignatureVerificationFailed,
+    /// The recipient address is invalid or for the wrong network.
+    InvalidRecipient,
+    /// The vault UTXO can't cover amount + fee (+ dust change).
+    InsufficientFunds,
+    /// A vault UTXO reference (txid/vout) is malformed.
+    InvalidUtxo,
+    /// Building the transaction failed.
+    TxBuild(String),
 }
 
 impl fmt::Display for VaultError {
@@ -71,6 +84,10 @@ impl fmt::Display for VaultError {
             Self::WrongRound(what) => write!(f, "Wrong round: {}", what),
             Self::NeedMoreSigners(what) => write!(f, "Need more {} to continue", what),
             Self::SignatureVerificationFailed => write!(f, "Signature verification FAILED"),
+            Self::InvalidRecipient => write!(f, "Invalid recipient address"),
+            Self::InsufficientFunds => write!(f, "Vault UTXO can't cover amount + fee"),
+            Self::InvalidUtxo => write!(f, "Invalid vault UTXO (expected txid:vout:value)"),
+            Self::TxBuild(e) => write!(f, "Transaction build failed: {}", e),
         }
     }
 }
@@ -146,6 +163,49 @@ impl VaultConfig {
         self.payment_code()?.receive_address(index).map_err(|_| VaultError::InvalidPaymentCode)
     }
 
+    /// BIP341 taproot context for the vault at a BIP47 child index:
+    /// (internal x-only key P, taproot tweak t, output key Q = P + t·G).
+    /// Deterministic — every device derives the same keys from the vault
+    /// config, so the taproot tweak needs no extra QR round trip.
+    pub fn taproot_context(
+        &self,
+        index: u32,
+    ) -> Result<([u8; 32], [u8; 32], [u8; 32]), VaultError> {
+        let secp = Secp256k1::new();
+        let agg = key_agg_sorted(&self.sorted_pks()?)?;
+        let il: [u8; 32] = self
+            .payment_code()?
+            .child_il(index)
+            .map_err(|_| VaultError::InvalidPaymentCode)?
+            .to_be_bytes();
+        let il_scalar = Scalar::from_be_bytes(il).map_err(|_| VaultError::MalformedQr)?;
+        let child_pk = agg
+            .agg_pubkey
+            .add_exp_tweak(&secp, &il_scalar)
+            .map_err(|_| VaultError::Musig("child tweak".into()))?;
+        let (internal, _) = child_pk.x_only_public_key();
+        let internal_ser = internal.serialize();
+        let t = taproot_tweak(&internal_ser);
+        let t_scalar = Scalar::from_be_bytes(t).map_err(|_| VaultError::MalformedQr)?;
+        let q_pk = PublicKey::from_x_only_public_key(internal, Parity::Even)
+            .add_exp_tweak(&secp, &t_scalar)
+            .map_err(|_| VaultError::Musig("taproot tweak".into()))?;
+        let (q, _) = q_pk.x_only_public_key();
+        Ok((internal_ser, t, q.serialize()))
+    }
+
+    /// A taproot (P2TR) receive address for the vault: child `index` of the
+    /// aggregate payment code, tweaked to the P2TR output key. Senders pay
+    /// the vault to bc1p… addresses; the 4-round ceremony spends them.
+    #[allow(dead_code)] // P2TR receive API — test-exercised; wired into the receive-QR flow later
+    pub fn receive_taproot_address(&self, index: u32) -> Result<String, VaultError> {
+        let (_, _, q) = self.taproot_context(index)?;
+        let spk = p2tr_script(&q);
+        Address::from_script(&spk, Network::Bitcoin)
+            .map(|a| a.to_string())
+            .map_err(|_| VaultError::InvalidPaymentCode)
+    }
+
     /// Participant public keys in the canonical BIP-327 sorted order — the
     /// EXACT order every signing session must use (key_agg is order-dependent).
     pub fn sorted_pks(&self) -> Result<Vec<[u8; 33]>, VaultError> {
@@ -161,6 +221,58 @@ impl VaultConfig {
     /// The x-only serialization of the aggregate key.
     pub fn agg_xonly(&self) -> Result<[u8; 32], VaultError> {
         Ok(key_agg_sorted(&self.sorted_pks()?)?.agg_xonly)
+    }
+
+    /// THIS device's partial contribution to the BIP47 shared secret when the
+    /// vault sends to a recipient payment code.
+    ///
+    /// BIP47 send: S = a·B where `a` is the sender's notification secret and
+    /// `B` is the recipient's payment-code pubkey at the send index. The vault
+    /// never reconstructs `a` (it is the sum of the devices' coeff·d shares), so
+    /// each device computes its partial point B·(a_i·d_i) and the coordinator
+    /// sums them (musig::combine_partials) — ECDH symmetry guarantees the sum
+    /// equals a·B, and the recipient recovers the same secret with its own key.
+    ///
+    /// `my_pk` is this device's identity pubkey; `my_secret` its BIP47 identity
+    /// secret (m/47'/0'/0'). Returns this device's 33-byte partial point.
+    pub fn ecdh_share(
+        &self,
+        secp: &Secp256k1<All>,
+        recipient_pub: &PublicKey,
+        my_pk: [u8; 33],
+        my_secret: &SecretKey,
+    ) -> Result<[u8; 33], VaultError> {
+        let agg = key_agg_sorted(&self.sorted_pks()?)?;
+        let pos = agg
+            .pks
+            .iter()
+            .position(|p| *p == my_pk)
+            .ok_or_else(|| VaultError::Musig("this device is not a vault participant".into()))?;
+        let coeff = &agg.coeffs[pos];
+        let share = crate::musig::ecdh_partial(secp, recipient_pub, coeff, my_secret)?;
+        Ok(share.serialize())
+    }
+
+    /// Sum all devices' ECDH partial points into the shared secret point and
+    /// return its raw x-coordinate (Sx) — the BIP47 shared secret the payment
+    /// address and the notification blinding both derive from.
+    pub fn combine_ecdh_shares(&self, shares: &[[u8; 33]]) -> Result<[u8; 32], VaultError> {
+        let partials: Vec<PublicKey> = shares
+            .iter()
+            .map(|s| PublicKey::from_slice(s).map_err(|_| VaultError::MalformedQr))
+            .collect::<Result<_, _>>()?;
+        let s = crate::musig::combine_partials(&partials)?;
+        let (x, _) = s.x_only_public_key();
+        Ok(x.serialize())
+    }
+
+    /// A bdk `tr()` descriptor watching the vault's P2TR receive address at
+    /// `index` — this is what the vault wallet syncs against so real vault
+    /// UTXOs (and thus the vault balance) auto-discover like the single-sig
+    /// home wallet does.
+    pub fn tr_descriptor(&self, index: u32) -> Result<String, VaultError> {
+        let (internal, _, _) = self.taproot_context(index)?;
+        Ok(format!("tr({})", hex::encode(internal)))
     }
 }
 
@@ -182,6 +294,10 @@ pub enum VaultQr {
     Session { msg: Vec<u8>, index: u32, aggnonce: [u8; 66] },
     /// DOJOV1|PSIG|<pk hex>|<psig hex> — round 3 contribution.
     Psig { pk: [u8; 33], psig: [u8; 32] },
+    /// DOJOV1|ECDH|<pk hex>|<share hex> — R0 contribution to a BIP47 send:
+    /// this device's partial ECDH point over the recipient's pubkey. Combined
+    /// across devices it recovers S = a·B without any device knowing `a`.
+    Ecdh { pk: [u8; 33], share: [u8; 33] },
 }
 
 impl VaultQr {
@@ -207,6 +323,12 @@ impl VaultQr {
                 QR_PROTOCOL,
                 hex::encode(pk),
                 hex::encode(psig)
+            ),
+            Self::Ecdh { pk, share } => format!(
+                "{}|ECDH|{}|{}",
+                QR_PROTOCOL,
+                hex::encode(pk),
+                hex::encode(share)
             ),
         }
     }
@@ -260,6 +382,15 @@ impl VaultQr {
                     de_hex(parts[3])?.try_into().map_err(|_| VaultError::MalformedQr)?;
                 Ok(Self::Psig { pk, psig })
             }
+            "ECDH" => {
+                if parts.len() != 4 {
+                    return Err(VaultError::MalformedQr);
+                }
+                let pk: [u8; 33] = de_hex(parts[2])?.try_into().map_err(|_| VaultError::MalformedQr)?;
+                let share: [u8; 33] =
+                    de_hex(parts[3])?.try_into().map_err(|_| VaultError::MalformedQr)?;
+                Ok(Self::Ecdh { pk, share })
+            }
             _ => Err(VaultError::MalformedQr),
         }
     }
@@ -295,6 +426,10 @@ pub struct VaultSpend {
     my_psig: Option<[u8; 32]>,
     /// Partial signatures collected from the other devices, keyed by pubkey.
     collected_psigs: Vec<([u8; 33], [u8; 32])>,
+    /// Real-taproot mode: the message is a BIP341 sighash and the session
+    /// adds the taproot tweak so the final signature verifies against the
+    /// P2TR output key (a spendable, broadcastable transaction).
+    taproot: bool,
 }
 
 impl VaultSpend {
@@ -309,7 +444,16 @@ impl VaultSpend {
             session: None,
             my_psig: None,
             collected_psigs: Vec::new(),
+            taproot: false,
         }
+    }
+
+    /// Create a spend for a REAL taproot transaction: the message is the
+    /// BIP341 key-path sighash and the session is tweaked for taproot.
+    pub fn new_for_tx(tx: &VaultTx, my_pk: [u8; 33]) -> Self {
+        let mut s = Self::new(tx.sighash.to_vec(), tx.index, my_pk);
+        s.taproot = true;
+        s
     }
 
     /// Round 1: generate this device's pubnonce. `rand` MUST be 32 fresh
@@ -394,10 +538,18 @@ impl VaultSpend {
             .child_il(self.index)
             .map_err(|_| VaultError::InvalidPaymentCode)?
             .to_be_bytes();
+        let mut tweaks = vec![Tweak { t: il, is_xonly: false }];
+        if self.taproot {
+            // BIP-327 taproot: the output key is P + int(TapTweak(P))·G,
+            // applied as an x-only tweak so the aggregate signature verifies
+            // against the P2TR output key the vault UTXO pays to.
+            let (_, tap_t, _) = vault.taproot_context(self.index)?;
+            tweaks.push(Tweak { t: tap_t, is_xonly: true });
+        }
         Ok(SessionContext {
             aggnonce,
             pks: vault.sorted_pks()?,
-            tweaks: vec![Tweak { t: il, is_xonly: false }],
+            tweaks,
             msg: self.msg.clone(),
         })
     }
@@ -510,25 +662,15 @@ impl VaultSpend {
         let sig = partial_sig_agg(&psigs, &session)?;
 
         // The final signature must verify against the CHILD (tweaked) key
-        // xonly(X + IL·G) — the key the BIP47 child address spends from.
+        // xonly(X + IL·G) — the key the BIP47 child address spends from —
+        // or, in taproot mode, against the P2TR OUTPUT key Q = P + t·G.
         let secp = Secp256k1::new();
-        let agg = key_agg_sorted(&session.pks)?;
-        let il: [u8; 32] = vault
-            .payment_code()?
-            .child_il(self.index)
-            .map_err(|_| VaultError::InvalidPaymentCode)?
-            .to_be_bytes();
-        let il_scalar = Scalar::from_be_bytes(il).map_err(|_| VaultError::MalformedQr)?;
-        let child_xonly = agg
-            .agg_pubkey
-            .add_exp_tweak(&secp, &il_scalar)
-            .map_err(|_| VaultError::Musig("child tweak".into()))?
-            .x_only_public_key()
-            .0;
+        let (internal_xonly, _, output_xonly) = vault.taproot_context(self.index)?;
+        let verify_key: [u8; 32] = if self.taproot { output_xonly } else { internal_xonly };
         let m = Message::from_digest_slice(&self.msg).map_err(|_| VaultError::MalformedQr)?;
         let s = schnorr::Signature::from_slice(&sig).map_err(|_| VaultError::MalformedQr)?;
-        let xonly = &child_xonly;
-        if secp.verify_schnorr(&s, &m, xonly).is_err() {
+        let xonly = XOnlyPublicKey::from_slice(&verify_key).map_err(|_| VaultError::MalformedQr)?;
+        if secp.verify_schnorr(&s, &m, &xonly).is_err() {
             return Err(VaultError::SignatureVerificationFailed);
         }
         Ok(sig)
@@ -595,6 +737,169 @@ pub fn demo_fixture_signing_keys() -> Vec<(SecretKey, [u8; 33])> {
             (d, pk)
         })
         .collect()
+}
+
+// =====================================================================
+// REAL TAPROOT SPEND — a VaultTx is an actual P2TR transaction whose
+// BIP341 key-path sighash is what the 4 QR rounds sign. R4 yields the
+// 64-byte BIP340 signature; attach_signature() returns the broadcastable
+// serialized transaction.
+// =====================================================================
+
+/// BIP-340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg).
+fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
+    let tag_hash = sha256::Hash::hash(tag);
+    let mut engine = sha256::Hash::engine();
+    engine.input(&tag_hash[..]);
+    engine.input(&tag_hash[..]);
+    engine.input(msg);
+    sha256::Hash::from_engine(engine).to_byte_array()
+}
+
+/// The BIP-341 taproot tweak t = int(TapTweak(P)) for an internal x-only
+/// key (empty merkle root — plain key-path spend).
+pub fn taproot_tweak(internal_xonly: &[u8; 32]) -> [u8; 32] {
+    tagged_hash(b"TapTweak", internal_xonly)
+}
+
+/// P2TR output script: OP_1 <32-byte output key>.
+pub(crate) fn p2tr_script(q_ser: &[u8; 32]) -> ScriptBuf {
+    let mut spk = Vec::with_capacity(34);
+    spk.push(0x51); // OP_1
+    spk.push(0x20); // push 32 bytes
+    spk.extend_from_slice(q_ser);
+    ScriptBuf::from_bytes(spk)
+}
+
+/// A real vault spend: a 1-input P2TR transaction paying `recipient` from a
+/// vault UTXO, whose BIP341 key-path sighash the 4 QR rounds sign.
+#[derive(Debug, Clone)]
+pub struct VaultTx {
+    /// BIP47 child index whose taproot key the UTXO pays to.
+    pub index: u32,
+    /// Destination address (mainnet).
+    pub recipient: String,
+    pub amount_sats: u64,
+    /// Actual fee = value - amount - change (dust folded in).
+    pub fee_sats: u64,
+    pub change_sats: u64,
+    /// BIP341 key-path sighash (SIGHASH_DEFAULT) — the session message.
+    pub sighash: [u8; 32],
+    tx: Transaction,
+}
+
+impl VaultTx {
+    /// Build a real spend of a vault UTXO paying to a mainnet recipient.
+    /// `feerate_sats_vb` is used to estimate the fee; change below dust is
+    /// folded into the fee (no dust output). The prevout must pay exactly
+    /// the vault's P2TR output key at `index`.
+    pub fn build(
+        vault: &VaultConfig,
+        index: u32,
+        recipient: &str,
+        amount_sats: u64,
+        feerate_sats_vb: u64,
+        utxo_txid: &str,
+        utxo_vout: u32,
+        utxo_value_sats: u64,
+    ) -> Result<Self, VaultError> {
+        let dest = Address::from_str(recipient)
+            .map_err(|_| VaultError::InvalidRecipient)?
+            .require_network(Network::Bitcoin)
+            .map_err(|_| VaultError::InvalidRecipient)?;
+        let dest_script = dest.script_pubkey();
+
+        let (_, _, output_xonly) = vault.taproot_context(index)?;
+        let vault_spk = p2tr_script(&output_xonly);
+
+        // 1-in-2-out key-path taproot ≈ 154 vB (10 header + 58 input + 2×43).
+        let vsize_est = 10 + 58 + 43 * 2;
+        let mut fee_sats = feerate_sats_vb.saturating_mul(vsize_est);
+        let total = amount_sats
+            .checked_add(fee_sats)
+            .ok_or(VaultError::InsufficientFunds)?;
+        let mut change_sats = utxo_value_sats
+            .checked_sub(total)
+            .ok_or(VaultError::InsufficientFunds)?;
+        if change_sats < 546 {
+            // Fold dust change into the fee; no change output.
+            change_sats = 0;
+            fee_sats = utxo_value_sats
+                .checked_sub(amount_sats)
+                .ok_or(VaultError::InsufficientFunds)?;
+        }
+
+        let txid = Txid::from_str(utxo_txid).map_err(|_| VaultError::InvalidUtxo)?;
+        let mut outputs = vec![TxOut {
+            value: Amount::from_sat(amount_sats),
+            script_pubkey: dest_script,
+        }];
+        if change_sats > 0 {
+            outputs.push(TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: vault_spk.clone(),
+            });
+        }
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(txid, utxo_vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: outputs,
+        };
+
+        let prevout = TxOut {
+            value: Amount::from_sat(utxo_value_sats),
+            script_pubkey: vault_spk,
+        };
+        let mut cache = SighashCache::new(&tx);
+        let sighash = cache
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prevout]), TapSighashType::Default)
+            .map_err(|e| VaultError::TxBuild(format!("sighash: {e}")))?
+            .to_byte_array();
+
+        Ok(Self {
+            index,
+            recipient: recipient.to_string(),
+            amount_sats,
+            fee_sats,
+            change_sats,
+            sighash,
+            tx,
+        })
+    }
+
+    /// Attach the 64-byte BIP340 key-path signature (SIGHASH_DEFAULT → no
+    /// sighash byte appended) and return the broadcastable tx hex.
+    pub fn attach_signature(&self, sig: [u8; 64]) -> Result<String, VaultError> {
+        let mut signed = self.tx.clone();
+        signed.input[0].witness = Witness::from_slice(&[sig]);
+        Ok(consensus::encode::serialize_hex(&signed))
+    }
+
+    /// Finalize the signed spend into a broadcastable PSBT: the unsigned
+    /// transaction with the 64-byte BIP340 key-path signature as the finalized
+    /// witness. This is the exact payload quantum-link's PublishPsbt expects,
+    /// so the R4 signature becomes a real network broadcast.
+    pub fn to_finalized_psbt(&self, sig: [u8; 64]) -> Result<Vec<u8>, VaultError> {
+        let mut psbt = ngwallet::bdk_wallet::bitcoin::psbt::Psbt::from_unsigned_tx(
+            self.tx.clone(),
+        )
+        .map_err(|e| VaultError::TxBuild(format!("psbt: {e}")))?;
+        psbt.inputs[0].final_script_witness = Some(Witness::from_slice(&[sig]));
+        Ok(psbt.serialize())
+    }
+}
+
+/// DEMO-ONLY (KEYOS_DEMO_VAULT=1): a deterministic fake vault UTXO paying
+/// the vault's taproot address at index 1 (0.05 BTC at vout 0).
+pub fn demo_vault_utxo() -> (String, u32, u64) {
+    let txid = sha256::Hash::hash(b"DOJO DEMO VAULT UTXO").to_byte_array();
+    (hex::encode(txid), 0, 5_000_000)
 }
 
 // =====================================================================
@@ -959,5 +1264,330 @@ mod tests {
         // partial_sig_verify must reject the corrupted signature, so no final
         // signature is ever produced.
         assert!(finalizer2.finalize(&vault).is_err());
+    }
+
+    #[test]
+    fn taproot_context_is_deterministic_and_parses() {
+        let (_, codes) = three_devices();
+        let vault = VaultConfig::build(&codes.to_vec()).unwrap();
+        let (internal, t, q) = vault.taproot_context(1).unwrap();
+        assert_eq!(internal.len(), 32);
+        assert_eq!(t.len(), 32);
+        assert_eq!(q.len(), 32);
+        // Deterministic — the same vault+index always derives the same keys.
+        assert_eq!(
+            vault.taproot_context(1).unwrap(),
+            vault.taproot_context(1).unwrap()
+        );
+        // The output key must differ from the internal key (tweaked).
+        assert_ne!(internal, q);
+        // The tweak is exactly the BIP341 TapTweak of the internal key.
+        assert_eq!(t, taproot_tweak(&internal));
+        // And it round-trips through a real P2TR address.
+        let addr = vault.receive_taproot_address(1).unwrap();
+        assert!(addr.starts_with("bc1p"), "P2TR address: {}", addr);
+        assert_ne!(vault.receive_taproot_address(1).unwrap(), vault.receive_taproot_address(2).unwrap());
+    }
+
+    #[test]
+    fn real_taproot_spend_signs_and_attaches() {
+        let secp = Secp256k1::new();
+        let (secrets, codes) = three_devices();
+        let vault = VaultConfig::build(&codes.to_vec()).unwrap();
+        let agg_xonly = vault.agg_xonly().unwrap();
+        let (txid, vout, value) = demo_vault_utxo();
+        let tx = VaultTx::build(
+            &vault,
+            1,
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            100_000,
+            4,
+            &txid,
+            vout,
+            value,
+        )
+        .unwrap();
+        assert_eq!(tx.sighash.len(), 32);
+        assert!(tx.fee_sats > 0);
+        assert!(tx.change_sats >= 546, "change {}", tx.change_sats);
+        assert_eq!(tx.amount_sats + tx.fee_sats + tx.change_sats, value);
+
+        // R1: every device creates a spend for the SAME real tx.
+        let mut spends: Vec<VaultSpend> = secrets
+            .iter()
+            .map(|d| {
+                let pk = PublicKey::from_secret_key(&secp, d).serialize();
+                VaultSpend::new_for_tx(&tx, pk)
+            })
+            .collect();
+        let mut nonce_qrs = Vec::new();
+        for (i, spend) in spends.iter_mut().enumerate() {
+            let mut rand = [0u8; 32];
+            rand[0] = 0x50 + i as u8;
+            let pn = spend.gen_nonce(rand, &secrets[i], agg_xonly).unwrap();
+            nonce_qrs.push(VaultQr::Nonce { pk: spend.my_pk, pubnonce: pn }.encode());
+        }
+
+        // R2: coordinator imports the other two nonces, builds the session.
+        let mut coordinator = spends.remove(0);
+        for qr in &nonce_qrs[1..] {
+            if let VaultQr::Nonce { pk, pubnonce } = VaultQr::decode(qr).unwrap() {
+                coordinator.add_pubnonce(pk, pubnonce);
+            }
+        }
+        let aggnonce = coordinator.build_session(&vault).unwrap();
+        let session_qr = VaultQr::Session {
+            msg: tx.sighash.to_vec(),
+            index: tx.index,
+            aggnonce,
+        }
+        .encode();
+
+        // R3: every signer scans the session and signs the REAL sighash.
+        let mut psig_qrs = Vec::new();
+        for (i, spend) in spends.iter_mut().enumerate() {
+            if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap()
+            {
+                spend.set_session(msg, index, aggnonce, &vault).unwrap();
+            }
+            let ps = spend.sign_partial(&secrets[i + 1]).unwrap();
+            psig_qrs.push(VaultQr::Psig { pk: spend.my_pk, psig: ps }.encode());
+        }
+        if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap() {
+            coordinator.set_session(msg, index, aggnonce, &vault).unwrap();
+        }
+        let coord_ps = coordinator.sign_partial(&secrets[0]).unwrap();
+        psig_qrs.push(VaultQr::Psig { pk: coordinator.my_pk, psig: coord_ps }.encode());
+
+        // R4: finalize — the sig must verify under the OUTPUT key Q.
+        for qr in &psig_qrs {
+            if let VaultQr::Psig { pk, psig } = VaultQr::decode(qr).unwrap() {
+                coordinator.add_psig(pk, psig);
+            }
+        }
+        let final_sig = coordinator.finalize(&vault).unwrap();
+        assert_eq!(final_sig.len(), 64);
+        let (_, _, q_bytes) = vault.taproot_context(tx.index).unwrap();
+        let q = XOnlyPublicKey::from_slice(&q_bytes).unwrap();
+        let m = Message::from_digest_slice(&tx.sighash).unwrap();
+        assert!(
+            secp.verify_schnorr(&schnorr::Signature::from_slice(&final_sig).unwrap(), &m, &q)
+                .is_ok(),
+            "final sig must verify under the taproot output key"
+        );
+        // NOT under the plain internal key — the tweak was applied.
+        let (internal_bytes, _, _) = vault.taproot_context(tx.index).unwrap();
+        let internal = XOnlyPublicKey::from_slice(&internal_bytes).unwrap();
+        assert!(
+            secp.verify_schnorr(&schnorr::Signature::from_slice(&final_sig).unwrap(), &m, &internal)
+                .is_err(),
+            "must NOT verify under the untweaked internal key"
+        );
+
+        // Attach → broadcastable tx with the 64-byte key-path witness.
+        let signed_hex = tx.attach_signature(final_sig).unwrap();
+        let signed: Transaction = consensus::encode::deserialize_hex(&signed_hex).unwrap();
+        assert_eq!(signed.input.len(), 1);
+        let wit = signed.input[0].witness.to_vec();
+        assert_eq!(wit.len(), 1, "one witness element");
+        assert_eq!(wit[0].len(), 64, "SIGHASH_DEFAULT → bare 64-byte sig");
+        assert_eq!(wit[0], final_sig.to_vec());
+        assert_eq!(signed.output.len(), 2);
+    }
+
+    #[test]
+    fn demo_taproot_send_produces_verified_signed_tx() {
+        let secp = Secp256k1::new();
+        let codes = demo_payment_codes();
+        let vault = VaultConfig::build(&codes).unwrap();
+        let agg_xonly = vault.agg_xonly().unwrap();
+        let (txid, vout, value) = demo_vault_utxo();
+        let tx = VaultTx::build(
+            &vault,
+            1,
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            100_000,
+            4,
+            &txid,
+            vout,
+            value,
+        )
+        .unwrap();
+
+        // Simulator device coordinates; the fixture devices fabricate.
+        let dummy = secret(0x99);
+        let dummy_pk = PublicKey::from_secret_key(&secp, &dummy).serialize();
+        let mut spend = VaultSpend::new_for_tx(&tx, dummy_pk);
+        spend.demo_fabricate_nonces(agg_xonly).unwrap();
+        spend.build_session(&vault).unwrap();
+        spend.demo_fabricate_psigs(agg_xonly).unwrap();
+        let final_sig = spend.finalize(&vault).unwrap();
+
+        // The signature verifies under the output key over the real sighash.
+        let (_, _, q_bytes) = vault.taproot_context(tx.index).unwrap();
+        let q = XOnlyPublicKey::from_slice(&q_bytes).unwrap();
+        let m = Message::from_digest_slice(&tx.sighash).unwrap();
+        assert!(secp.verify_schnorr(&schnorr::Signature::from_slice(&final_sig).unwrap(), &m, &q).is_ok());
+
+        let signed_hex = tx.attach_signature(final_sig).unwrap();
+        let signed: Transaction = consensus::encode::deserialize_hex(&signed_hex).unwrap();
+        assert_eq!(signed.input[0].witness.to_vec()[0], final_sig.to_vec());
+    }
+
+    #[test]
+    fn qr_payloads_never_expose_secret_material() {
+        // The QR codec must ONLY ever carry public material: public keys,
+        // public nonces, public partial signatures. This runs the FULL
+        // 3-device flow and asserts no encoded QR string contains the hex of
+        // any device's secret key or its 97-byte secret secnonce.
+        let secp = Secp256k1::new();
+        let (secrets, codes) = three_devices();
+        let vault = VaultConfig::build(&codes.to_vec()).unwrap();
+        let agg_xonly = vault.agg_xonly().unwrap();
+        let msg = spend_message("VAULT SPEND leak test");
+
+        // R1: every device generates + exports a pubnonce QR.
+        let mut spends: Vec<VaultSpend> = secrets
+            .iter()
+            .map(|d| {
+                let pk = PublicKey::from_secret_key(&secp, d).serialize();
+                VaultSpend::new(msg.to_vec(), 1, pk)
+            })
+            .collect();
+        let mut all_qrs: Vec<String> = Vec::new();
+        let mut secnonces: Vec<[u8; 97]> = Vec::new();
+        for (i, spend) in spends.iter_mut().enumerate() {
+            let mut rand = [0u8; 32];
+            rand[0] = 0x40 + i as u8;
+            let pn = spend.gen_nonce(rand, &secrets[i], agg_xonly).unwrap();
+            secnonces.push(spend.secnonce.expect("secnonce set"));
+            all_qrs.push(VaultQr::Nonce { pk: spend.my_pk, pubnonce: pn }.encode());
+        }
+
+        // R2: coordinator builds the session QR.
+        let mut coordinator = spends.remove(0);
+        for qr in &all_qrs[1..] {
+            if let VaultQr::Nonce { pk, pubnonce } = VaultQr::decode(qr).unwrap() {
+                coordinator.add_pubnonce(pk, pubnonce);
+            }
+        }
+        let aggnonce = coordinator.build_session(&vault).unwrap();
+        let session_qr =
+            VaultQr::Session { msg: msg.to_vec(), index: 1, aggnonce }.encode();
+        all_qrs.push(session_qr.clone());
+
+        // R3: every signer exports a partial-signature QR.
+        for (i, spend) in spends.iter_mut().enumerate() {
+            if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap() {
+                spend.set_session(msg, index, aggnonce, &vault).unwrap();
+            }
+            let ps = spend.sign_partial(&secrets[i + 1]).unwrap();
+            all_qrs.push(VaultQr::Psig { pk: spend.my_pk, psig: ps }.encode());
+        }
+        if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap() {
+            coordinator.set_session(msg, index, aggnonce, &vault).unwrap();
+        }
+        let coord_ps = coordinator.sign_partial(&secrets[0]).unwrap();
+        all_qrs.push(VaultQr::Psig { pk: coordinator.my_pk, psig: coord_ps }.encode());
+
+        // Assert: no device secret key hex and no secnonce hex ever appears.
+        for d in secrets.iter() {
+            let secret_hex = hex::encode(d.secret_bytes());
+            for qr in &all_qrs {
+                assert!(!qr.contains(&secret_hex), "secret key leaked into QR: {qr}");
+            }
+        }
+        for sec in &secnonces {
+            let sec_hex = hex::encode(sec);
+            for qr in &all_qrs {
+                assert!(!qr.contains(&sec_hex), "secnonce leaked into QR: {qr}");
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_psbt_never_exposes_secret_material() {
+        // The PSBT that gets broadcast must contain only the public tx and
+        // the public 64-byte signature — never a device secret key or the
+        // 97-byte secret secnonce.
+        let secp = Secp256k1::new();
+        let (secrets, codes) = three_devices();
+        let vault = VaultConfig::build(&codes.to_vec()).unwrap();
+        let agg_xonly = vault.agg_xonly().unwrap();
+        let (txid, vout, value) = demo_vault_utxo();
+        let tx = VaultTx::build(
+            &vault,
+            1,
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            100_000,
+            4,
+            &txid,
+            vout,
+            value,
+        )
+        .unwrap();
+
+        // R1: real nonces for the real tx.
+        let mut spends: Vec<VaultSpend> = secrets
+            .iter()
+            .map(|d| {
+                let pk = PublicKey::from_secret_key(&secp, d).serialize();
+                VaultSpend::new_for_tx(&tx, pk)
+            })
+            .collect();
+        let mut nonce_qrs = Vec::new();
+        let mut secnonces: Vec<[u8; 97]> = Vec::new();
+        for (i, spend) in spends.iter_mut().enumerate() {
+            let mut rand = [0u8; 32];
+            rand[0] = 0x50 + i as u8;
+            let pn = spend.gen_nonce(rand, &secrets[i], agg_xonly).unwrap();
+            secnonces.push(spend.secnonce.expect("secnonce set"));
+            nonce_qrs.push(VaultQr::Nonce { pk: spend.my_pk, pubnonce: pn }.encode());
+        }
+
+        // R2: coordinator session.
+        let mut coordinator = spends.remove(0);
+        for qr in &nonce_qrs[1..] {
+            if let VaultQr::Nonce { pk, pubnonce } = VaultQr::decode(qr).unwrap() {
+                coordinator.add_pubnonce(pk, pubnonce);
+            }
+        }
+        let aggnonce = coordinator.build_session(&vault).unwrap();
+        let session_qr =
+            VaultQr::Session { msg: tx.sighash.to_vec(), index: 1, aggnonce }.encode();
+
+        // R3: every signer signs.
+        let mut psig_qrs = Vec::new();
+        for (i, spend) in spends.iter_mut().enumerate() {
+            if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap() {
+                spend.set_session(msg, index, aggnonce, &vault).unwrap();
+            }
+            let ps = spend.sign_partial(&secrets[i + 1]).unwrap();
+            psig_qrs.push(VaultQr::Psig { pk: spend.my_pk, psig: ps }.encode());
+        }
+        if let VaultQr::Session { msg, index, aggnonce } = VaultQr::decode(&session_qr).unwrap() {
+            coordinator.set_session(msg, index, aggnonce, &vault).unwrap();
+        }
+        let coord_ps = coordinator.sign_partial(&secrets[0]).unwrap();
+        psig_qrs.push(VaultQr::Psig { pk: coordinator.my_pk, psig: coord_ps }.encode());
+
+        // R4: finalize + serialize the broadcastable PSBT.
+        for qr in &psig_qrs {
+            if let VaultQr::Psig { pk, psig } = VaultQr::decode(qr).unwrap() {
+                coordinator.add_psig(pk, psig);
+            }
+        }
+        let final_sig = coordinator.finalize(&vault).unwrap();
+        let psbt = tx.to_finalized_psbt(final_sig).unwrap();
+        let psbt_hex = hex::encode(&psbt);
+
+        for d in secrets.iter() {
+            let secret_hex = hex::encode(d.secret_bytes());
+            assert!(!psbt_hex.contains(&secret_hex), "device secret leaked into PSBT hex");
+        }
+        for sec in &secnonces {
+            let sec_hex = hex::encode(sec);
+            assert!(!psbt_hex.contains(&sec_hex), "secnonce leaked into PSBT hex");
+        }
     }
 }

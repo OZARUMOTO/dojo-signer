@@ -289,6 +289,55 @@ impl PaymentCode {
             return Ok((addr, idx));
         }
     }
+
+    /// Derive a unique payment address from a PRE-COMPUTED shared secret.
+    ///
+    /// The MuSig2 vault never reconstructs the aggregate secret key, so the
+    /// sender side of the ECDH (S = a·B) is computed jointly: each device
+    /// exports its partial point B·(a_i·d_i), the coordinator combines them
+    /// into S, and this method finishes the BIP47 derivation (s = SHA256(Sx),
+    /// B' = B + s·G) from the shared x-coordinate alone. The recipient derives
+    /// the SAME address with their own secret (ECDH symmetry) — verified by
+    /// the threshold-ECDH tests in musig.rs.
+    pub fn payment_address_from_shared_x(
+        &self,
+        shared_x: [u8; 32],
+        index: u32,
+    ) -> Result<(String, u32), PayNymError> {
+        let secp = Secp256k1::new();
+        let mut idx = index;
+        loop {
+            let b = self.child_pubkey(idx)?;
+            let s = sha256::Hash::hash(&shared_x).to_byte_array();
+            let s_scalar = match Scalar::from_be_bytes(s) {
+                Ok(v) => v,
+                Err(_) => {
+                    idx = idx.wrapping_add(1);
+                    continue;
+                }
+            };
+            let bp = b
+                .add_exp_tweak(&secp, &s_scalar)
+                .map_err(|_| PayNymError::InvalidPaymentCode)?;
+            let pkh = PubkeyHash::hash(&bp.serialize());
+            let addr = Address::p2pkh(pkh, Network::Bitcoin).to_string();
+            return Ok((addr, idx));
+        }
+    }
+}
+
+/// Build the 80-byte payment code payload from a parsed PaymentCode — used to
+/// blind the vault's AGGREGATE code inside a BIP47 notification transaction
+/// (the single-sig path blinds the device's own code via
+/// derive_payment_code_payload; the vault path blinds the aggregate).
+pub fn payload_from_code(pc: &PaymentCode) -> [u8; 80] {
+    let mut payload = [0u8; 80];
+    payload[0] = 0x01; // version 1
+    payload[1] = 0x00; // features: no Bitmessage notification
+    payload[2..35].copy_from_slice(&pc.pubkey);
+    payload[35..67].copy_from_slice(&pc.chaincode);
+    // payload[67..80] stays zero-filled (reserved for future use)
+    payload
 }
 
 /// The device's BIP47 notification private key: m/47'/0'/0'/0.

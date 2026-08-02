@@ -66,6 +66,18 @@ export component VaultPage inherits BasePage {
                     visible: CB.vault-notif != "";
                 }
                 Text {
+                    text: "Vault balance: " + CB.vault-balance-display + " (" + CB.vault-utxo-count + " UTXOs)";
+                    color: #00ff88; font-size: 11px; font-weight: 700;
+                    visible: CB.vault-aggregate != "";
+                }
+                Rectangle {
+                    height: 20px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;
+                    visible: CB.vault-aggregate != "";
+                    TouchArea { clicked => { CB.vault-refresh-balance(); } }
+                    Text { text: "🔄 Refresh Vault Balance"; color: #0f0; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text {
                     text: "Receive: " + CB.vault-receive-addr;
                     color: #0f0; font-size: 9px; wrap: word-wrap;
                     visible: CB.vault-receive-addr != "";
@@ -84,6 +96,114 @@ export component VaultPage inherits BasePage {
                     TouchArea { clicked => { CB.vault-export-vault(); } }
                     Text { text: "📷 Show Vault Code QR"; color: #0aa; font-size: 10px; font-weight: 700;
                         horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #005500;
+            visible: CB.vault-aggregate != "";
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "# Send Bitcoin (real taproot)"; color: #00ff88; font-size: 12px; font-weight: 700; }
+
+                Text { text: "Recipient address"; color: #888; font-size: 9px; }
+                TextInput {
+                    text <=> CB.vault-send-address;
+                    color: #fff; font-size: 9px;
+                }
+
+                Text { text: "Amount (sats)"; color: #888; font-size: 9px; }
+                TextInput {
+                    text <=> CB.vault-send-amount;
+                    color: #fff; font-size: 9px;
+                }
+
+                Text { text: "Fee rate (sats/vB)"; color: #888; font-size: 9px; }
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 20px; background: CB.vault-send-feerate == 1 ? #040 : #022;
+                        border-radius: 2px; border-width: 1px; border-color: #060;
+                        TouchArea { clicked => { CB.vault-pick-feerate(1); } }
+                        Text { text: "1"; color: #0f0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: CB.vault-send-feerate == 2 ? #040 : #022;
+                        border-radius: 2px; border-width: 1px; border-color: #060;
+                        TouchArea { clicked => { CB.vault-pick-feerate(2); } }
+                        Text { text: "2"; color: #0f0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: CB.vault-send-feerate == 4 ? #040 : #022;
+                        border-radius: 2px; border-width: 1px; border-color: #060;
+                        TouchArea { clicked => { CB.vault-pick-feerate(4); } }
+                        Text { text: "4"; color: #0f0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: CB.vault-send-feerate == 8 ? #040 : #022;
+                        border-radius: 2px; border-width: 1px; border-color: #060;
+                        TouchArea { clicked => { CB.vault-pick-feerate(8); } }
+                        Text { text: "8"; color: #0f0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: CB.vault-send-feerate == 16 ? #040 : #022;
+                        border-radius: 2px; border-width: 1px; border-color: #060;
+                        TouchArea { clicked => { CB.vault-pick-feerate(16); } }
+                        Text { text: "16"; color: #0f0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Rectangle {
+                    visible: !CB.vault-demo-enabled;
+                    VerticalLayout { spacing: 2px;
+                        Text { text: "Vault UTXO (txid:vout:value:index)"; color: #888; font-size: 9px; }
+                        TextInput {
+                            text <=> CB.vault-send-utxo;
+                            color: #fff; font-size: 9px;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 24px; background: #030; border-radius: 2px; border-width: 1px; border-color: #060;
+                    TouchArea { clicked => { CB.vault-send(CB.vault-send-address, CB.vault-send-amount, CB.vault-send-feerate); } }
+                    Text { text: "⚡ SEND"; color: #0f0; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: "BIP47 private send (PM8T recipient):"; color: #888; font-size: 9px; }
+                GridLayout { spacing: 3px;
+                    Rectangle {
+                        height: 20px; background: #022; border-radius: 2px; border-width: 1px; border-color: #055;
+                        TouchArea { clicked => { CB.vault-scan-ecdh(); } }
+                        Text { text: "R0: Scan ECDH Share"; color: #0aa; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 20px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                        TouchArea { clicked => { CB.vault-ecdh-finish(); } }
+                        Text { text: "R0: Finish ECDH → Derive"; color: #fa0; font-size: 10px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Rectangle {
+                    height: 24px; background: #003; border-radius: 2px; border-width: 1px; border-color: #046;
+                    visible: CB.vault-signed-tx != "";
+                    TouchArea { clicked => { CB.vault-broadcast(); } }
+                    Text { text: "📡 BROADCAST"; color: #4af; font-size: 11px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text { text: CB.vault-send-status; color: #0aa; font-size: 9px; wrap: word-wrap; visible: CB.vault-send-status != ""; }
+                Text {
+                    text: "Signed tx: " + CB.vault-signed-tx;
+                    color: #0f0; font-size: 8px; wrap: word-wrap;
+                    visible: CB.vault-signed-tx != "";
                 }
             }
         }
@@ -186,24 +306,39 @@ export component VaultPage inherits BasePage {
         }
 
         Rectangle {
-            background: #000; border-radius: 2px;
-            height: 150px;
-            visible: CB.show-vault-qr;
-            VerticalLayout { padding: 4px; spacing: 2px;
-                Text { text: CB.vault-qr-label; color: #888; font-size: 9px; }
-                Image {
-                    source: CB.vault-qr-image;
-                    height: 120px; width: 120px;
-                    horizontal-alignment: center;
-                }
-            }
-        }
-
-        Rectangle {
             height: 18px; background: #0a0000; border-radius: 2px;
             TouchArea { clicked => { CB.goto-home(); } }
             Text { text: "[back]"; color: #c44; font-size: 9px;
                 horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+
+    // Floating QR modal — covers the page whenever a vault QR is shown
+    // (receive address, vault code, R1–R4). Tap ✕ or the backdrop to dismiss.
+    Rectangle {
+        x: 0; y: 0; width: 100%; height: 100%;
+        background: #000000D9;
+        visible: CB.show-vault-qr;
+        TouchArea { clicked => { CB.vault-close-qr(); } }
+        Rectangle {
+            x: (parent.width - 176px) / 2;
+            y: (parent.height - 232px) / 2;
+            width: 176px; height: 232px;
+            background: #000; border-radius: 4px; border-width: 1px; border-color: #0a0;
+            VerticalLayout { padding: 6px; spacing: 4px;
+                Text { text: CB.vault-qr-label; color: #888; font-size: 9px; wrap: word-wrap; horizontal-alignment: center; }
+                Image {
+                    source: CB.vault-qr-image;
+                    height: 140px; width: 140px;
+                    horizontal-alignment: center;
+                }
+                Rectangle {
+                    height: 24px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                    TouchArea { clicked => { CB.vault-close-qr(); } }
+                    Text { text: "✕ Close"; color: #f66; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
         }
     }
 }

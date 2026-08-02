@@ -7,10 +7,11 @@ en = "DOJO SIGNER"
 [permissions]
 template = ["gui-app", "fs-generic"]
 "os/gui-server" = ["GetPendingNavRequest"]
-"os/security" = ["GetSeed", "GetSeedFingerprint", "GetDeviceId", "GetRandom"]
+"os/security" = ["GetSeed", "GetSeedFingerprint", "GetDeviceId", "GetRandom", "GetAppSeed"]
 "os/quantum-link" = [
     "SendAccountUpdate",
     "PublishPsbt",
+    "ScripthashListUnspent",
     "SubscribeSignPsbt",
     "SubscribeAccountUpdate",
     "SubscribeConnectionStatus",

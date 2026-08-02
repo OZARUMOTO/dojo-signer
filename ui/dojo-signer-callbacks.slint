@@ -71,6 +71,18 @@ export global DojoSignerCallbacks {
     in-out property <bool> vault-demo-enabled: false;
     in-out property <string> vault-qr-label: "";
 
+    // Real taproot send form
+    in-out property <string> vault-send-address: "";
+    in-out property <string> vault-send-amount: "";
+    in-out property <int> vault-send-feerate: 4;
+    in-out property <string> vault-send-utxo: "";
+    in-out property <string> vault-send-status: "";
+    in-out property <string> vault-signed-tx: "";
+
+    // Real vault balance + UTXO discovery (SEPARATE wallet from the single-sig home)
+    in-out property <string> vault-balance-display: "0 sats";
+    in-out property <int> vault-utxo-count: 0;
+
     // ============ CALLBACKS ============
     // Navigation
     callback goto-home();
@@ -116,6 +128,7 @@ export global DojoSignerCallbacks {
     callback vault-scan-setup();
     callback vault-build();
     callback vault-export-vault();
+    callback vault-close-qr();
     callback vault-demo-inject();
     callback vault-demo-nonces();
     callback vault-demo-psigs();
@@ -128,4 +141,10 @@ export global DojoSignerCallbacks {
     callback vault-sign();
     callback vault-scan-psig();
     callback vault-finalize();
+    callback vault-send(string, string, int);
+    callback vault-pick-feerate(int);
+    callback vault-refresh-balance();
+    callback vault-scan-ecdh();
+    callback vault-ecdh-finish();
+    callback vault-broadcast();
 }
