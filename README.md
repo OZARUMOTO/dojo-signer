@@ -457,7 +457,7 @@ os/fs             → GetUserReadAccess, GetUserWriteAccess (config + history pe
 - [x] **Real vault spend** — full taproot transaction built on-device with the BIP341 sighash, MuSig2-signed across the 4-round ceremony, final signature verified (`real_taproot_spend_signs_and_attaches`, `demo_taproot_send_produces_verified_signed_tx`)
 - [ ] Wire the real vault spend to a connected node/companion broadcast path (hardware signer signs; node broadcasts)
 - [ ] End-to-end BLE round-trip test with the real companion app
-- [ ] Real-hardware validation on three Passport Prime dev units
+- [ ] Real-hardware validation on one Passport Prime dev unit and to test the 3 of 3 vault multisig requires 3 passport prime which ill have to do another time 
 
 ---
 
