@@ -135,6 +135,41 @@ mod tests {
         assert!(split_addr("host:notaport").is_err());
     }
 
+    fn empty_psbt() -> Psbt {
+        let tx = ngwallet::bdk_wallet::bitcoin::Transaction {
+            version: ngwallet::bdk_wallet::bitcoin::transaction::Version(2),
+            lock_time: ngwallet::bdk_wallet::bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    const OK_TXID: &str =
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+    /// A canned fake relay: reads one broadcast envelope, verifies its shape,
+    /// replies with the given response line. Mirrors electrum.rs's
+    /// `canned_server_crlf` test convention.
+    fn canned_relay(reply: String) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let env: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(env["type"], "broadcast");
+            let psbt_b64 = env["psbt"].as_str().unwrap_or("");
+            assert!(!psbt_b64.is_empty(), "envelope must carry a base64 PSBT");
+            assert!(psbt_b64.starts_with("cHNid"), "expected PSBT magic");
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
     #[test]
     fn connection_refused_is_io_error() {
         // Bind a socket and close it so the port is (almost certainly) free,
@@ -142,14 +177,38 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let tx = ngwallet::bdk_wallet::bitcoin::Transaction {
-            version: ngwallet::bdk_wallet::bitcoin::transaction::Version(2),
-            lock_time: ngwallet::bdk_wallet::bitcoin::absolute::LockTime::ZERO,
-            input: vec![],
-            output: vec![],
-        };
-        let psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        let err = broadcast_psbt(&format!("127.0.0.1:{port}"), &psbt).unwrap_err();
+        let err = broadcast_psbt(&format!("127.0.0.1:{port}"), &empty_psbt()).unwrap_err();
         assert!(matches!(err, RelayError::Io(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn happy_path_roundtrips_txid() {
+        let reply = format!(
+            "{{\"type\":\"broadcast-result\",\"id\":\"1\",\"txid\":\"{}\",\"error\":null}}\n",
+            OK_TXID
+        );
+        let (port, handle) = canned_relay(reply);
+        let txid = broadcast_psbt(&format!("127.0.0.1:{port}"), &empty_psbt()).unwrap();
+        assert_eq!(txid, OK_TXID);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn node_error_reply_is_surfaced() {
+        let (port, handle) = canned_relay(
+            "{\"type\":\"broadcast-result\",\"id\":\"1\",\"txid\":null,\"error\":\"rpc error -22: TX decode failed\"}\n"
+                .into(),
+        );
+        let err = broadcast_psbt(&format!("127.0.0.1:{port}"), &empty_psbt()).unwrap_err();
+        assert!(matches!(err, RelayError::Node(e) if e.contains("TX decode failed")));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn bad_reply_type_is_surfaced() {
+        let (port, handle) = canned_relay("{\"type\":\"page\",\"id\":\"1\"}\n".into());
+        let err = broadcast_psbt(&format!("127.0.0.1:{port}"), &empty_psbt()).unwrap_err();
+        assert!(matches!(err, RelayError::BadReply(_)), "got {err:?}");
+        handle.join().unwrap();
     }
 }
