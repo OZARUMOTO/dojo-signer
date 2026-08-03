@@ -89,7 +89,7 @@ Terminal-styled secure display — black background, red monospace text:
 - **Double-spend protection**: the payment tx marks the notification's input `unspendable`, so the two can never collide
 - **Stranded-funds protection**: if the notification tx can't be built, the payment is skipped with a clear message
 - Per-recipient BIP47 index persisted only on success → failed sends re-derive the same address
-- *Broadcasting the signed tx on-chain requires a connected Electrum node — see the roadmap.*
+- *Broadcasting: signed PSBTs are submitted to the **surf-relay** gateway, which asks your own bitcoind to finalize + broadcast them (`finalizepsbt` → `sendrawtransaction`) and returns the txid — no third party, no companion needed. On hardware the companion app fronts the same path.*
 
 ### ✅ BIP47 Message Verifier
 - Paste or scan a message + base64 signature + sender payment code
@@ -250,6 +250,11 @@ Real `SigningRequest` handling — the protocol types come from the actual Ashig
        Device A ── pubnonce ──► Device B (coordinator) ── session ──► C
        Device C ── psig ──────► Device B ── psig from A ──► aggregate
        B finalizes → 64-byte BIP340 sig, verified vs vault child key
+
+  Broadcast (surf-relay gateway → your node — hosted sim / LAN):
+       Device ── broadcast{psbt} ──► surf-relay (TCP 8787)
+                                         └─► bitcoind finalizepsbt → sendrawtransaction
+                                             └─► txid back to the device (no third party)
 ```
 
 ### Project Structure
@@ -267,6 +272,7 @@ dojo-signer/
 │   ├── musig.rs            # BIP-327 MuSig2 primitives — key agg, nonce, partial sigs (1,446 lines)
 │   ├── vault.rs            # 3-of-3 vault app layer — config, QR codec, 4-round spend, taproot tx (963 lines)
 │   ├── electrum.rs         # Electrum protocol client — scripthash UTXO discovery for the vault
+│   ├── relay.rs            # surf-relay broadcast client — finalize+broadcast via your node
 │   ├── cred.rs             # Encrypted-at-rest credential vault (HMAC envelope, derive-key)
 │   ├── coinjoin.rs         # Whirlpool protocol types (v0.23) + base64 helpers
 │   ├── message.rs          # BIP47 message verifier types + history
@@ -453,9 +459,9 @@ os/fs             → GetUserReadAccess, GetUserWriteAccess (config + history pe
 - [x] Whirlpool PSBT signing over Quantum Link BLE (real inputs/values/witnesses)
 - [x] Pool selection + node config persistence + verification history
 - [x] 48/48 unit tests (8 bip47 + 5 cred + 6 electrum + 13 musig + 13 vault + 3 config/integration)
-- [ ] Electrum `blockchain.transaction.broadcast` for live on-chain sends
+- [x] **Live on-chain broadcast** — signed PSBTs route through the surf-relay gateway to your own bitcoind (`finalizepsbt` + `sendrawtransaction`), txid returned to the device
 - [x] **Real vault spend** — full taproot transaction built on-device with the BIP341 sighash, MuSig2-signed across the 4-round ceremony, final signature verified (`real_taproot_spend_signs_and_attaches`, `demo_taproot_send_produces_verified_signed_tx`)
-- [ ] Wire the real vault spend to a connected node/companion broadcast path (hardware signer signs; node broadcasts)
+- [x] Wire the real vault spend to a connected node broadcast path — the finalized vault PSBT broadcasts through the surf-relay gateway to your node (hardware signs; node broadcasts)
 - [ ] End-to-end BLE round-trip test with the real companion app
 - [ ] Real-hardware validation on one Passport Prime dev unit and to test the 3 of 3 vault multisig requires 3 passport prime which ill have to do another time 
 

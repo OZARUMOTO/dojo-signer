@@ -38,6 +38,7 @@ use std::sync::Mutex;
 mod bip47;
 mod cred;
 mod electrum;
+mod relay;
 mod musig;
 mod vault;
 mod coinjoin;
@@ -278,6 +279,12 @@ struct AppConfig {
     /// deterministic per index).
     #[serde(default = "default_vault_receive_index")]
     vault_receive_index: u32,
+    /// surf-relay broadcast gateway ("host:port"). When set, signed PSBTs
+    /// are finalized + submitted by the relay to the LAN bitcoin node — no
+    /// companion needed. When unreachable the app falls back to the
+    /// quantum-link companion path.
+    #[serde(default = "default_relay")]
+    relay: String,
 }
 
 fn default_pool_id() -> String {
@@ -288,6 +295,14 @@ fn default_pool_id() -> String {
 /// notification address, shown separately).
 fn default_vault_receive_index() -> u32 {
     1
+}
+
+/// Default broadcast relay: the local surf-relay gateway that fronts the LAN
+/// bitcoin node (hosted simulator talks to 127.0.0.1:8787; on hardware the
+/// companion fronts the same protocol and this default is unreachable, so the
+/// quantum-link path takes over).
+fn default_relay() -> String {
+    "127.0.0.1:8787".into()
 }
 
 /// Render the persisted BIP47 verification history for the Verify page.
@@ -470,8 +485,29 @@ fn build_signed_psbt(
     Ok(psbt)
 }
 
-/// Broadcast a signed PSBT via Quantum Link (companion app → Dojo).
+/// Broadcast a signed PSBT.
+///
+/// 1. If a surf-relay gateway is configured, the relay finalizes the PSBT
+///    with its bitcoind and submits it to the node (hosted sim / LAN node —
+///    no third party, no companion needed).
+/// 2. Fallback: Quantum Link PublishPsbt to the companion app, which does
+///    the actual broadcast on hardware (cold signs, companion transmits).
 async fn broadcast_psbt(psbt: ngwallet::bdk_wallet::bitcoin::Psbt) -> anyhow::Result<()> {
+    let relay_addr = load_app_config().relay.trim().to_string();
+    if !relay_addr.is_empty() {
+        match crate::relay::broadcast_psbt(&relay_addr, &psbt) {
+            Ok(txid) => {
+                log::info!("📡 Broadcast via relay {} — txid {}", relay_addr, txid);
+                return Ok(());
+            }
+            Err(e) => log::warn!(
+                "📡 relay broadcast unavailable ({}): {} — falling back to companion",
+                relay_addr,
+                e
+            ),
+        }
+    }
+
     let message = PublishPsbt {
         transaction: BroadcastTransaction {
             account_id: "dojo-signer-0".into(),
