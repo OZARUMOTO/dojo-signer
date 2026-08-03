@@ -30,6 +30,11 @@ export global DojoSignerCallbacks {
     in-out property <string> password-input: "";
     in-out property <string> node-status: "Disconnected";
 
+    // Broadcast relay (surf-relay gateway -> your own bitcoind)
+    in-out property <string> relay-input: "127.0.0.1:8787";
+    in-out property <string> relay-status: "—";
+    in-out property <string> relay-last: "no broadcasts yet";
+
     // Coinjoin / Whirlpool
     in-out property <string> mix-id: "awaiting_dojo_connection";
     in-out property <string> mix-status: "Idle";
@@ -108,6 +113,7 @@ export global DojoSignerCallbacks {
     // Node connection
     callback connect-node(string, string, bool, string, string);
     callback disconnect-node();
+    callback probe-relay();
 
     // QR Scan
     callback scan-qr-address();

@@ -70,6 +70,39 @@ export component SettingsPage inherits BasePage {
 
                 Text { text: "Status: " + CB.node-status; color: #888; font-size: 10px; }
                 Text { text: "BLE Companion: " + CB.ble-status; color: #888; font-size: 10px; }
+            }
+        }
+
+        Rectangle {
+            height: 24px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Broadcast Relay (surf-relay → your node)"; color: #0af; font-size: 13px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Relay host:port (device → relay → your bitcoind)"; color: #888; font-size: 10px; }
+                TextInput {
+                    text <=> CB.relay-input;
+                    color: #fff; font-size: 10px;
+                }
+
+                GridLayout { spacing: 4px;
+                    Rectangle {
+                        height: 24px; background: #005; border-radius: 2px; border-width: 1px; border-color: #06a;
+                        TouchArea {
+                            clicked => { CB.probe-relay(); }
+                        }
+                        Text { text: "PROBE RELAY"; color: #4cf; font-size: 11px; font-weight: 700;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+
+                Text { text: "Relay: " + CB.relay-status; color: #888; font-size: 10px; }
+                Text { text: "Last broadcast: " + CB.relay-last; color: #888; font-size: 10px; }
 
                 Rectangle {
                     height: 18px; background: #0a0000; border-radius: 2px;

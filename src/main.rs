@@ -59,6 +59,9 @@ pub use coinjoin::{
 static PENDING_PSBT: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 /// Pending Whirlpool protocol signing request
 static PENDING_SIGNING: Mutex<Option<SigningRequest>> = Mutex::new(None);
+/// Last surf-relay broadcast outcome (txid or node error), shown on the
+/// settings page so the user sees what happened to the last broadcast.
+static LAST_RELAY_RESULT: Mutex<String> = Mutex::new(String::new());
 
 /// MuSig2 vault: participant payment codes collected via QR, the built
 /// vault config, and the active spend session (in-memory; the vault config
@@ -140,6 +143,36 @@ fn apply_vault_build(ui: &AppWindow, parts: &[String]) {
                 .set_vault_error(format!("Build failed: {}", e).into())
         }
     }
+}
+
+/// Probe the configured surf-relay gateway and reflect the result on the
+/// settings page (relay-status + last broadcast outcome). When `persist` is
+/// set (user pressed PROBE) the edited address is saved so broadcasts use it;
+/// the boot-time probe never writes config (security may still be locked).
+fn probe_relay_ui(ui: &AppWindow, persist: bool) {
+    let cb = ui.global::<DojoSignerCallbacks>();
+    let addr = cb.get_relay_input().to_string().trim().to_string();
+    if persist {
+        let mut cfg = load_app_config();
+        cfg.relay = addr.clone();
+        save_app_config(&cfg);
+    }
+    if addr.is_empty() {
+        cb.set_relay_status("⚠️ no relay configured — companion path only".into());
+        return;
+    }
+    cb.set_relay_status(format!("⏳ probing {}…", addr).into());
+    let ui2 = ui.as_weak();
+    spawn_local(async move {
+        let ui = ui2.unwrap();
+        let cb = ui.global::<DojoSignerCallbacks>();
+        match crate::relay::ping(&addr) {
+            Ok(_) => cb.set_relay_status(format!("🟢 online — {}", addr).into()),
+            Err(e) => cb.set_relay_status(format!("🔴 offline ({})", e).into()),
+        }
+        cb.set_relay_last(LAST_RELAY_RESULT.lock().unwrap().clone().into());
+    })
+    .detach();
 }
 
 /// Open the system QR scanner and return the scanned text (if any).
@@ -498,13 +531,17 @@ async fn broadcast_psbt(psbt: ngwallet::bdk_wallet::bitcoin::Psbt) -> anyhow::Re
         match crate::relay::broadcast_psbt(&relay_addr, &psbt) {
             Ok(txid) => {
                 log::info!("📡 Broadcast via relay {} — txid {}", relay_addr, txid);
+                *LAST_RELAY_RESULT.lock().unwrap() = format!("✅ txid {}", txid);
                 return Ok(());
             }
-            Err(e) => log::warn!(
-                "📡 relay broadcast unavailable ({}): {} — falling back to companion",
-                relay_addr,
-                e
-            ),
+            Err(e) => {
+                log::warn!(
+                    "📡 relay broadcast unavailable ({}): {} — falling back to companion",
+                    relay_addr,
+                    e
+                );
+                *LAST_RELAY_RESULT.lock().unwrap() = format!("❌ relay: {}", e);
+            }
         }
     }
 
@@ -778,6 +815,15 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 cfg.ssl
             );
         }
+
+        // Restore the surf-relay broadcast gateway + last outcome, then probe
+        // it once so the settings page shows live relay status at boot.
+        global.set_relay_input(cfg.relay.clone().into());
+        global.set_relay_last(LAST_RELAY_RESULT.lock().unwrap().clone().into());
+        if !cfg.relay.trim().is_empty() {
+            log::info!("📡 Broadcast relay configured: {}", cfg.relay);
+        }
+        probe_relay_ui(&ui, false);
 
         // Restore the MuSig2 vault if it was built before the reboot.
         if !cfg.vault_participants.is_empty() {
@@ -1259,6 +1305,13 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             let ui = ui_weak2.unwrap();
             ui.global::<DojoSignerCallbacks>().set_node_status("Disconnected".into());
             log::info!("🔌 Node disconnected");
+        });
+
+        let ui_weak_relay = ui.as_weak();
+        global.on_probe_relay(move || {
+            let ui = ui_weak_relay.unwrap();
+            probe_relay_ui(&ui, true);
+            log::info!("📡 Relay probe requested");
         });
     }
 

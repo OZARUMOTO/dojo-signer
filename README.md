@@ -89,7 +89,8 @@ Terminal-styled secure display — black background, red monospace text:
 - **Double-spend protection**: the payment tx marks the notification's input `unspendable`, so the two can never collide
 - **Stranded-funds protection**: if the notification tx can't be built, the payment is skipped with a clear message
 - Per-recipient BIP47 index persisted only on success → failed sends re-derive the same address
-- *Broadcasting: signed PSBTs are submitted to the **surf-relay** gateway, which asks your own bitcoind to finalize + broadcast them (`finalizepsbt` → `sendrawtransaction`) and returns the txid — no third party, no companion needed. On hardware the companion app fronts the same path.*
+- *Broadcasting: signed PSBTs are submitted to the **surf-relay** gateway, which asks your own bitcoind to finalize + broadcast them (`finalizepsbt` → `sendrawtransaction`) and returns the txid — no third party, no companion needed. On hardware the companion app fronts the same path (relay-first, Electrum fallback).*
+- *Settings page shows live **relay status** — the device probes the gateway (`ping`→`pong`), shows online/offline + the last broadcast outcome (txid or node error).*
 
 ### ✅ BIP47 Message Verifier
 - Paste or scan a message + base64 signature + sender payment code
@@ -227,6 +228,13 @@ Real `SigningRequest` handling — the protocol types come from the actual Ashig
 ### 🔗 Node Connection
 - Electrum server settings: **host, port, SSL, username, password**
 - Persisted to AppData and auto-restored on launch
+
+### 📡 Broadcast Relay (surf-relay)
+- Editable relay `host:port` (default `127.0.0.1:8787`) on the Settings page
+- **PROBE RELAY** button: `ping`→`pong` against the gateway → 🟢 online / 🔴 offline
+- **Last broadcast** line: the txid or node error from the most recent relay send
+- On hardware the companion routes the same envelope to the relay over HTTP
+  (`POST /broadcast`) with fallback to the Electrum path
 
 ---
 

@@ -46,6 +46,47 @@ impl core::fmt::Display for RelayError {
 
 impl std::error::Error for RelayError {}
 
+/// Probe the relay gateway with a `ping` envelope (the settings UI shows
+/// relay online/offline from this). Returns Ok(()) when the relay answers
+/// `pong` within the timeout.
+pub fn ping(relay: &str) -> Result<(), RelayError> {
+    let (host, port) = split_addr(relay)?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| RelayError::Io(e.to_string()))?
+        .next()
+        .ok_or_else(|| RelayError::Io("no address resolved".into()))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|e| RelayError::Io(format!("connect {relay}: {e}")))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| RelayError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| RelayError::Io(e.to_string()))?;
+
+    stream
+        .write_all(b"{\"type\":\"ping\"}\n")
+        .map_err(|e| RelayError::Io(format!("send ping: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| RelayError::Io(format!("flush: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .map_err(|e| RelayError::Io(format!("read pong: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(reply.trim())
+        .map_err(|e| RelayError::BadReply(format!("ping reply not json: {e}")))?;
+    if v.get("type").and_then(|t| t.as_str()) == Some("pong") {
+        Ok(())
+    } else {
+        Err(RelayError::BadReply(format!("unexpected ping reply: {reply}")))
+    }
+}
+
 /// Split a "host:port" relay address into its parts.
 fn split_addr(relay: &str) -> Result<(String, u16), RelayError> {
     let (host, port) = relay
@@ -208,6 +249,37 @@ mod tests {
     fn bad_reply_type_is_surfaced() {
         let (port, handle) = canned_relay("{\"type\":\"page\",\"id\":\"1\"}\n".into());
         let err = broadcast_psbt(&format!("127.0.0.1:{port}"), &empty_psbt()).unwrap_err();
+        assert!(matches!(err, RelayError::BadReply(_)), "got {err:?}");
+        handle.join().unwrap();
+    }
+
+    /// A canned relay that answers a ping with the given reply.
+    fn canned_ping(reply: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert!(line.contains("\"type\":\"ping\""), "expected ping, got {line}");
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn ping_ok_when_pong() {
+        let (port, handle) = canned_ping("{\"type\":\"pong\"}\n");
+        ping(&format!("127.0.0.1:{port}")).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn ping_fails_on_unexpected_reply() {
+        let (port, handle) = canned_ping("{\"type\":\"page\",\"id\":\"1\"}\n");
+        let err = ping(&format!("127.0.0.1:{port}")).unwrap_err();
         assert!(matches!(err, RelayError::BadReply(_)), "got {err:?}");
         handle.join().unwrap();
     }
