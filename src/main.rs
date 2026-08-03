@@ -152,6 +152,11 @@ fn apply_vault_build(ui: &AppWindow, parts: &[String]) {
 fn probe_relay_ui(ui: &AppWindow, persist: bool) {
     let cb = ui.global::<DojoSignerCallbacks>();
     let addr = cb.get_relay_input().to_string().trim().to_string();
+    // NOTE: saving here (user pressed PROBE) can rewrite config while the
+    // user may not be logged in — protect_node_password fails closed and
+    // clears any legacy plaintext node password, same as the existing
+    // CONNECT-node save path. The boot-time probe never saves (persist=false)
+    // so startup can't touch credentials.
     if persist {
         let mut cfg = load_app_config();
         cfg.relay = addr.clone();
