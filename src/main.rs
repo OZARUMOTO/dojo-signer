@@ -1954,6 +1954,10 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                     // MuSig2 taproot addresses can't be derived from any
                     // single xpub, so tell the local bwt to watch this one
                     // (the exact index the discovery loop queries).
+                    // HOSTED-ONLY: the device never opens sockets (BLE-only);
+                    // on hardware the companion fronts the same Electrum
+                    // endpoint via quantum-link.
+                    #[cfg(not(keyos))]
                     if let Ok(taproot_addr) = vcfg.receive_taproot_address(idx) {
                         if let Err(e) = track::register(&taproot_addr) {
                             log::debug!("📡 track vault #{} failed: {}", idx, e);
