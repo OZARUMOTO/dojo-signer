@@ -2806,7 +2806,81 @@ fn hex_short(bytes: &[u8]) -> String {
 
 /// Refresh the on-device balance + UTXO summary from the synced wallet.
 /// Uses the real utxo.rs coin-control types (UtxoDisplayItem / UtxoSummary / UtxoReviewList).
+/// How many BIP84 external receive addresses the singlesig checking account
+/// registers + watches through the box's bwt (fresh addresses are derived
+/// deterministically from the device seed — nothing needs to be imported).
+const SINGLESIG_WATCH_DEPTH: u32 = 20;
+
+/// Refresh the singlesig checking-account balance + UTXO summary.
+///
+/// HOSTED SIMULATOR (not keyos): the in-memory bdk wallet is never synced, so
+/// `bdk.list_unspent()` is ALWAYS empty and can never see real funds. Instead
+/// discover the balance through the box's bwt the same way the vault does:
+/// derive the BIP84 receive addresses, register each with bwt
+/// (POST /track_address, so it imports and watches them) and query
+/// `blockchain.scripthash.listunspent` for every one.
+///
+/// REAL DEVICE (keyos): the companion syncs the bdk wallet via account
+/// updates over Quantum Link, so the in-wallet path is correct there.
 fn refresh_balance(ui: &AppWindow) {
+    #[cfg(not(keyos))]
+    {
+        let cfg = load_app_config();
+        let host = cfg.host.clone();
+        let port = cfg.port;
+        let ssl = cfg.ssl;
+        if !host.is_empty() && !ssl {
+            let ui_weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let wallet = match create_bip84_wallet(Network::Bitcoin, 0) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        log::debug!("💰 singlesig wallet unavailable: {}", e);
+                        return;
+                    }
+                };
+                let bdk = match wallet.bdk_wallet.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let mut items: Vec<crate::utxo::UtxoDisplayItem> = Vec::new();
+                for index in 0..=SINGLESIG_WATCH_DEPTH {
+                    let addr = bdk.peek_address(KeychainKind::External, index);
+                    // Register the derived address with the local bwt so it
+                    // imports it into the wallet and reports UTXOs here.
+                    if let Err(e) = track::register(&addr.to_string()) {
+                        log::debug!("📡 track singlesig #{} failed: {}", index, e);
+                    }
+                    let sh = electrum::scripthash_hex(addr.script_pubkey().as_bytes());
+                    match electrum::list_unspent(&host, port, &sh) {
+                        Ok(utxos) => {
+                            for u in utxos {
+                                items.push(crate::utxo::UtxoDisplayItem {
+                                    txid_short: u.tx_hash.chars().take(12).collect(),
+                                    value_sats: u.value_sats,
+                                    is_doxxic: false,
+                                    anonset: 0,
+                                    mix_state_icon: "⛓".into(),
+                                    reviewed: false,
+                                });
+                            }
+                        }
+                        Err(e) => log::debug!("💰 singlesig electrum #{}: {}", index, e),
+                    }
+                }
+                let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        set_balance_ui(&ui, items);
+                    }
+                });
+            });
+            return;
+        }
+    }
+
+    // Fallback / real device (keyos): the companion syncs the bdk wallet via
+    // account updates. On hosted this is the honest empty path when no node is
+    // configured or SSL is set (the plain-TCP client can't do TLS).
     let utxo_items: Vec<crate::utxo::UtxoDisplayItem> =
         match create_bip84_wallet(Network::Bitcoin, 0) {
             Ok(wallet) => {
@@ -2831,6 +2905,11 @@ fn refresh_balance(ui: &AppWindow) {
             }
         };
 
+    set_balance_ui(ui, utxo_items);
+}
+
+/// Push a singlesig UTXO set to the UI (shared by both balance paths).
+fn set_balance_ui(ui: &AppWindow, utxo_items: Vec<crate::utxo::UtxoDisplayItem>) {
     if utxo_items.is_empty() {
         log::info!("🪙 No UTXOs yet — {}", crate::utxo::UtxoError::NoUtxos);
     }
