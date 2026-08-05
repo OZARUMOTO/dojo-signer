@@ -302,6 +302,11 @@ struct AppConfig {
     #[serde(default)]
     password_enc: String,
     receive_index: u32,
+    /// Next change-address child index for the singlesig wallet (hosted
+    /// spends send change to a fresh internal address; persisted so change
+    /// addresses are never reused across sends).
+    #[serde(default)]
+    change_index: u32,
     /// Next unused BIP47 payment index per recipient payment code.
     bip47_indices: BTreeMap<String, u32>,
     /// Selected Whirlpool pool denomination (0.5/0.25/0.1/0.05/0.01 btc).
@@ -491,7 +496,390 @@ fn save_app_config(cfg: &AppConfig) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HOSTED singlesig spends (cfg(not(keyos)) only)
+//
+// The in-memory bdk wallet is never synced on hosted, so `bdk.list_unspent()`
+// can never see real coins. Instead we discover the wallet's REAL UTXOs
+// through the box's bwt Electrum server (same discovery as refresh_balance),
+// reveal the scripts into the bdk wallet index (so update_psbt_with_descriptor
+// can attribute keys), and build the transaction MANUALLY — the same pattern
+// VaultTx::build already uses. The signed PSBT then rides the normal relay /
+// quantum-link broadcast path unchanged.
+// ---------------------------------------------------------------------------
+
+/// One real unspent output of the singlesig wallet, discovered through the
+/// box's bwt Electrum server (hosted builds only).
+#[cfg(not(keyos))]
+#[derive(Debug, Clone)]
+struct HostedUtxo {
+    outpoint: ngwallet::bdk_wallet::bitcoin::OutPoint,
+    prevout: ngwallet::bdk_wallet::bitcoin::TxOut,
+    keychain: KeychainKind,
+    index: u32,
+}
+
+/// Run a blocking closure on a background thread and await its result from
+/// the async executor, so the hosted UI stays responsive during node I/O
+/// (the send-path builders make real TCP/HTTP round trips to the box's bwt).
+/// Dependency-free: std mpsc + futures-lite yield_now (already in the tree).
+async fn run_blocking<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                slint_keyos_platform::futures_lite::future::yield_now().await;
+            }
+            Err(_) => unreachable!("sender dropped without sending"),
+        }
+    }
+}
+
+/// HOSTED ONLY. Discover the singlesig wallet's real UTXOs through the box's
+/// bwt Electrum server: derive BIP84 external + internal addresses
+/// 0..=SINGLESIG_WATCH_DEPTH, register each with bwt (so they are imported
+/// and watched), reveal the scripts into the bdk wallet index (so signing can
+/// attribute the right key), and collect every unspent output with its real
+/// prevout. Used by both the balance display and the manual spend builders.
+#[cfg(not(keyos))]
+fn discover_hosted_singlesig(wallet: &NgWallet<NullPersister>) -> anyhow::Result<Vec<HostedUtxo>> {
+    use ngwallet::bdk_wallet::bitcoin::{Amount, OutPoint, TxOut, Txid};
+    use std::str::FromStr;
+
+    let cfg = load_app_config();
+    if cfg.host.is_empty() || cfg.ssl {
+        return Err(anyhow::anyhow!(
+            "no plain-TCP node configured (host='{}', ssl={})",
+            cfg.host,
+            cfg.ssl
+        ));
+    }
+    let host = cfg.host.clone();
+    let port = cfg.port;
+
+    let mut found = Vec::new();
+    {
+        let mut bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        // Track every watch script in the wallet index so
+        // update_psbt_with_descriptor can derive the right keys when signing.
+        bdk.reveal_addresses_to(KeychainKind::External, SINGLESIG_WATCH_DEPTH).count();
+        bdk.reveal_addresses_to(KeychainKind::Internal, SINGLESIG_WATCH_DEPTH).count();
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            for index in 0..=SINGLESIG_WATCH_DEPTH {
+                let addr = bdk.peek_address(keychain, index);
+                if let Err(e) = track::register(&addr.to_string()) {
+                    log::debug!("📡 track singlesig {:?}#{} failed: {}", keychain, index, e);
+                }
+                let sh = electrum::scripthash_hex(addr.script_pubkey().as_bytes());
+                match electrum::list_unspent(&host, port, &sh) {
+                    Ok(utxos) => {
+                        for u in utxos {
+                            let txid = Txid::from_str(&u.tx_hash)
+                                .map_err(|e| anyhow::anyhow!("bad txid {}: {e}", u.tx_hash))?;
+                            found.push(HostedUtxo {
+                                outpoint: OutPoint::new(txid, u.tx_pos),
+                                prevout: TxOut {
+                                    value: Amount::from_sat(u.value_sats),
+                                    script_pubkey: addr.script_pubkey(),
+                                },
+                                keychain,
+                                index,
+                            });
+                        }
+                    }
+                    Err(e) => log::debug!("💰 singlesig electrum {:?}#{}: {}", keychain, index, e),
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// HOSTED ONLY. Build + sign a PSBT sending `amount_sats` to `dest_script`
+/// using REAL UTXOs discovered through the box's bwt Electrum server. Manual
+/// greedy coin selection (largest first), a fresh persisted internal change
+/// address, RBF sequence, then signed via the wallet (scripts were revealed by
+/// discover_hosted_singlesig). `exclude_outpoint` keeps a BIP47 notification
+/// input from being re-spent by the payment tx.
+#[cfg(not(keyos))]
+fn build_hosted_signed_psbt(
+    dest_script: ngwallet::bdk_wallet::bitcoin::ScriptBuf,
+    amount_sats: u64,
+    fee_sats: u64,
+    exclude_outpoint: Option<ngwallet::bdk_wallet::bitcoin::OutPoint>,
+) -> anyhow::Result<ngwallet::bdk_wallet::bitcoin::Psbt> {
+    use ngwallet::bdk_wallet::bitcoin::{
+        absolute, transaction, Amount, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+    let mut available = discover_hosted_singlesig(&wallet)?;
+    if let Some(excl) = exclude_outpoint {
+        available.retain(|u| u.outpoint != excl);
+    }
+    if available.is_empty() {
+        return Err(anyhow::anyhow!(
+            "No UTXOs available — deposit to a receive address first"
+        ));
+    }
+
+    // Greedy: largest first until inputs cover amount + fee.
+    available.sort_by_key(|u| std::cmp::Reverse(u.prevout.value.to_sat()));
+    let fee_rate = (fee_sats / 250).max(1); // sat/vB, same semantics as the UI
+    let mut picked: Vec<HostedUtxo> = Vec::new();
+    let mut total = 0u64;
+    for u in available {
+        total = total.saturating_add(u.prevout.value.to_sat());
+        picked.push(u);
+        // P2WPKH estimate: 10 base + 68/input + 31×2 outputs.
+        let vsize = 10 + 68 * picked.len() as u64 + 31 * 2;
+        let fee = fee_rate.saturating_mul(vsize);
+        if total >= amount_sats.saturating_add(fee) {
+            break;
+        }
+    }
+    let vsize = 10 + 68 * picked.len() as u64 + 31 * 2;
+    let fee = fee_rate.saturating_mul(vsize);
+    if total < amount_sats.saturating_add(fee) {
+        return Err(anyhow::anyhow!(
+            "Insufficient funds — {total} sats available, need {amount_sats} + ~{fee} fee"
+        ));
+    }
+
+    // Change to a fresh internal address. The counter is kept inside the
+    // bwt-watched window (mod depth) so change stays visible to the balance
+    // discovery; every address in the window is watched by refresh_balance.
+    let mut cfg = load_app_config();
+    let change_index = cfg.change_index;
+    cfg.change_index = (cfg.change_index + 1) % (SINGLESIG_WATCH_DEPTH + 1);
+    save_app_config(&cfg);
+    let change_spk = {
+        let bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let addr = bdk.peek_address(KeychainKind::Internal, change_index);
+        if let Err(e) = track::register(&addr.to_string()) {
+            log::debug!("📡 track change #{} failed: {}", change_index, e);
+        }
+        addr.script_pubkey()
+    };
+
+    let mut outputs = vec![TxOut {
+        value: Amount::from_sat(amount_sats),
+        script_pubkey: dest_script,
+    }];
+    let change_sats = total.saturating_sub(amount_sats.saturating_add(fee));
+    if change_sats >= 546 {
+        outputs.push(TxOut {
+            value: Amount::from_sat(change_sats),
+            script_pubkey: change_spk,
+        });
+    }
+
+    let tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: picked
+            .iter()
+            .map(|u| TxIn {
+                previous_output: u.outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: outputs,
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| anyhow::anyhow!("psbt: {e}"))?;
+    for (i, u) in picked.iter().enumerate() {
+        psbt.inputs[i].witness_utxo = Some(u.prevout.clone());
+    }
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    let signed = wallet
+        .bdk_wallet
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock: {e}"))?
+        .sign(&mut psbt, options)
+        .map_err(|e| anyhow::anyhow!("Sign: {e}"))?;
+    if !signed {
+        return Err(anyhow::anyhow!(
+            "wallet could not sign the transaction inputs (scripts not tracked?)"
+        ));
+    }
+    Ok(psbt)
+}
+
+/// HOSTED ONLY. Build + sign the BIP47 notification transaction from a REAL
+/// discovered designated input (its outpoint drives the blinding): OP_RETURN
+/// with the blinded payload, dust to the recipient's notification address,
+/// and change to a fresh internal address. Mirrors the keyos builder, but the
+/// tx is constructed manually because the hosted bdk graph is never synced.
+#[cfg(not(keyos))]
+fn build_hosted_notification_psbt(
+    pc: &bip47::PaymentCode,
+    payload: &[u8; 80],
+) -> anyhow::Result<Option<(ngwallet::bdk_wallet::bitcoin::Psbt, ngwallet::bdk_wallet::bitcoin::OutPoint)>> {
+    use ngwallet::bdk_wallet::bitcoin::{
+        absolute,
+        bip32::{ChildNumber, Xpriv},
+        consensus,
+        hashes::{
+            hmac::{Hmac, HmacEngine},
+            sha512, Hash, HashEngine,
+        },
+        script::PushBytesBuf,
+        secp256k1::Secp256k1,
+        transaction, Address, Amount, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+    use std::str::FromStr;
+
+    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+    let mut available = discover_hosted_singlesig(&wallet)?;
+    if available.is_empty() {
+        return Ok(None);
+    }
+    available.sort_by_key(|u| std::cmp::Reverse(u.prevout.value.to_sat()));
+    let input = available.remove(0);
+
+    // Private key of the designated input (BIP84 path of this UTXO).
+    let secp = Secp256k1::new();
+    let master = load_master_key(Network::Bitcoin)?;
+    let internal = input.keychain == KeychainKind::Internal;
+    let path = [
+        ChildNumber::from_hardened_idx(84)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(0)?,
+        ChildNumber::from_hardened_idx(if internal { 1 } else { 0 })?,
+        ChildNumber::Normal { index: input.index },
+    ];
+    let root = Xpriv::new_master(Network::Bitcoin, &master.key.0)
+        .map_err(|e| anyhow::anyhow!("xpriv: {e}"))?;
+    let input_secret = root.derive_priv(&secp, &path)?.private_key;
+
+    // Blinding: s = HMAC-SHA512(outpoint, x), then blind the payload bytes.
+    let b_pub = pc.child_pubkey(0)?;
+    let x = bip47::ecdh_x_coordinate(&secp, &b_pub, &input_secret)?;
+    let outpoint_bytes = consensus::serialize(&input.outpoint);
+    let mut engine = HmacEngine::<sha512::Hash>::new(&outpoint_bytes);
+    engine.input(&x);
+    let mask = Hmac::from_engine(engine).to_byte_array();
+
+    let mut blinded = [0u8; 80];
+    blinded[..3].copy_from_slice(&payload[..3]);
+    for i in 0..32 {
+        blinded[3 + i] = payload[3 + i] ^ mask[i];
+    }
+    for i in 0..32 {
+        blinded[35 + i] = payload[35 + i] ^ mask[32 + i];
+    }
+    blinded[67..].copy_from_slice(&payload[67..]);
+
+    let notif_addr = Address::from_str(&pc.notification_address()?)
+        .map_err(|e| anyhow::anyhow!("notif addr: {e}"))?
+        .require_network(Network::Bitcoin)
+        .map_err(|_| anyhow::anyhow!("wrong network"))?;
+
+    let mut op_return = PushBytesBuf::new();
+    op_return.extend_from_slice(&blinded)?;
+
+    // Change to a fresh internal address, kept in the bwt-watched window.
+    let mut cfg = load_app_config();
+    let change_index = cfg.change_index;
+    cfg.change_index = (cfg.change_index + 1) % (SINGLESIG_WATCH_DEPTH + 1);
+    save_app_config(&cfg);
+    let change_spk = {
+        let bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let addr = bdk.peek_address(KeychainKind::Internal, change_index);
+        if let Err(e) = track::register(&addr.to_string()) {
+            log::debug!("📡 track change #{} failed: {}", change_index, e);
+        }
+        addr.script_pubkey()
+    };
+
+    // 1 designated P2WPKH input + OP_RETURN output (an 80-byte data output is
+    // ~91 vB: 8 value + 1 len + 1 OP_RETURN + 1 pushlen + 80) + dust + change.
+    let fee_rate = 4u64; // sat/vB
+    let dust = Amount::from_sat(1000);
+    let vsize = 10 + 68 + 91 + 31 + 31;
+    let fee = fee_rate.saturating_mul(vsize);
+    let input_value = input.prevout.value.to_sat();
+    // Never build a tx whose outputs exceed the input (would be invalid and
+    // fail confusingly at broadcast).
+    if input_value < dust.to_sat().saturating_add(fee) {
+        return Err(anyhow::anyhow!(
+            "notification input too small ({} sats) for dust + fee (~{} sats)",
+            input_value,
+            dust.to_sat() + fee
+        ));
+    }
+    let change_sats = input_value - dust.to_sat() - fee;
+    let mut outputs = vec![
+        TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::new_op_return(&op_return),
+        },
+        TxOut {
+            value: dust,
+            script_pubkey: notif_addr.script_pubkey(),
+        },
+    ];
+    if change_sats >= 546 {
+        outputs.push(TxOut {
+            value: Amount::from_sat(change_sats),
+            script_pubkey: change_spk,
+        });
+    }
+    let tx = Transaction {
+        version: transaction::Version::TWO,
+        lock_time: absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: input.outpoint,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: outputs,
+    };
+    let mut psbt = Psbt::from_unsigned_tx(tx).map_err(|e| anyhow::anyhow!("psbt: {e}"))?;
+    psbt.inputs[0].witness_utxo = Some(input.prevout.clone());
+    let options = SignOptions {
+        trust_witness_utxo: true,
+        ..SignOptions::default()
+    };
+    let signed = wallet
+        .bdk_wallet
+        .lock()
+        .map_err(|e| anyhow::anyhow!("lock: {e}"))?
+        .sign(&mut psbt, options)
+        .map_err(|e| anyhow::anyhow!("Sign: {e}"))?;
+    if !signed {
+        return Err(anyhow::anyhow!(
+            "wallet could not sign the notification input (scripts not tracked?)"
+        ));
+    }
+
+    if psbt.unsigned_tx.input.len() != 1 {
+        return Err(anyhow::anyhow!(
+            "notification tx must have exactly 1 input (UTXO too small for fee + outputs)"
+        ));
+    }
+    Ok(Some((psbt, input.outpoint)))
+}
+
 /// Build + sign a PSBT sending `amount_sats` to `address` at the given fee.
+///
+/// HOSTED (not keyos): the in-memory bdk wallet is never synced, so the PSBT
+/// is built from REAL UTXOs discovered through the box's bwt Electrum server
+/// (see build_hosted_signed_psbt). The `unreachable_code` lint is allowed
+/// because the keyos branch after the early return only compiles on device.
+#[allow(unreachable_code)]
 fn build_signed_psbt(
     address: &str,
     amount_sats: u64,
@@ -505,6 +893,13 @@ fn build_signed_psbt(
         .map_err(|e| anyhow::anyhow!("Invalid address: {}", e))?
         .require_network(Network::Bitcoin)
         .map_err(|_| anyhow::anyhow!("Wrong network"))?;
+
+    // HOSTED: build + sign from REAL UTXOs discovered through the box's bwt
+    // Electrum server (the bdk wallet graph is never synced on hosted).
+    #[cfg(not(keyos))]
+    {
+        return build_hosted_signed_psbt(dest.script_pubkey(), amount_sats, fee_sats, exclude_outpoint);
+    }
 
     let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
 
@@ -610,7 +1005,14 @@ async fn send_bip47(target: &str, amount_sats: u64, fee_sats: u64) -> anyhow::Re
     let mut notif_outpoint: Option<ngwallet::bdk_wallet::bitcoin::OutPoint> = None;
     let mut abort_payment = false;
     if first_contact {
-        match build_notification_psbt(&pc) {
+        // HOSTED: notification build discovers the designated input through
+        // the box's bwt — run it on a background thread (see create_and_broadcast_psbt).
+        let notif_result = run_blocking({
+            let pc = pc.clone();
+            move || build_notification_psbt(&pc)
+        })
+        .await;
+        match notif_result {
             Ok(Some((psbt, outpoint))) => {
                 // Whether broadcast succeeds now or the PSBT is exported later,
                 // the payment tx must never spend the notification's input.
@@ -644,7 +1046,11 @@ async fn send_bip47(target: &str, amount_sats: u64, fee_sats: u64) -> anyhow::Re
 
     // Payment transaction to the derived BIP47 address.
     let mut sent = false;
-    let pay_status = match build_signed_psbt(&payment_addr, amount_sats, fee_sats, notif_outpoint) {
+    let pay_status = match run_blocking({
+        let payment_addr = payment_addr.clone();
+        move || build_signed_psbt(&payment_addr, amount_sats, fee_sats, notif_outpoint)
+    })
+    .await {
         Ok(psbt) => {
             let txid = psbt.unsigned_tx.compute_txid().to_string();
             match broadcast_psbt(psbt).await {
@@ -681,6 +1087,7 @@ payment: {}
 /// real designated input (its outpoint drives the blinding), an OP_RETURN with
 /// the blinded payment code, and a dust output to the recipient's notification
 /// address. Returns None when the wallet has no UTXOs yet.
+#[allow(unreachable_code)]
 fn build_notification_psbt(
     pc: &bip47::PaymentCode,
 ) -> anyhow::Result<Option<(ngwallet::bdk_wallet::bitcoin::Psbt, ngwallet::bdk_wallet::bitcoin::OutPoint)>> {
@@ -696,6 +1103,14 @@ fn build_notification_psbt(
         Amount, FeeRate, Network,
     };
     use std::str::FromStr;
+
+    // HOSTED: the bdk wallet graph is never synced — build the notification
+    // from a REAL discovered designated input (blinding + OP_RETURN + dust).
+    #[cfg(not(keyos))]
+    {
+        let payload = bip47::derive_payment_code_payload()?;
+        return build_hosted_notification_psbt(pc, &payload);
+    }
 
     let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
 
@@ -2774,7 +3189,14 @@ async fn create_and_broadcast_psbt(
     amount_sats: u64,
     fee_sats: u64,
 ) -> anyhow::Result<String> {
-    let psbt = build_signed_psbt(&address, amount_sats, fee_sats, None)?;
+    // HOSTED: the builder makes real network round trips (discovery via the
+    // box's bwt) — run it on a background thread so the UI executor stays
+    // responsive even if the node is slow or down.
+    let psbt = run_blocking({
+        let address = address.clone();
+        move || build_signed_psbt(&address, amount_sats, fee_sats, None)
+    })
+    .await?;
     let txid = psbt.unsigned_tx.compute_txid().to_string();
     broadcast_psbt(psbt).await?;
     Ok(txid)
@@ -2826,10 +3248,7 @@ fn refresh_balance(ui: &AppWindow) {
     #[cfg(not(keyos))]
     {
         let cfg = load_app_config();
-        let host = cfg.host.clone();
-        let port = cfg.port;
-        let ssl = cfg.ssl;
-        if !host.is_empty() && !ssl {
+        if !cfg.host.is_empty() && !cfg.ssl {
             let ui_weak = ui.as_weak();
             std::thread::spawn(move || {
                 let wallet = match create_bip84_wallet(Network::Bitcoin, 0) {
@@ -2839,35 +3258,27 @@ fn refresh_balance(ui: &AppWindow) {
                         return;
                     }
                 };
-                let bdk = match wallet.bdk_wallet.lock() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
+                // Real discovery through the box's bwt: register + watch the
+                // derived addresses (external AND internal, so change shows)
+                // and render every real unspent output.
+                let found = match discover_hosted_singlesig(&wallet) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::debug!("💰 singlesig discovery unavailable: {}", e);
+                        return;
+                    }
                 };
-                let mut items: Vec<crate::utxo::UtxoDisplayItem> = Vec::new();
-                for index in 0..=SINGLESIG_WATCH_DEPTH {
-                    let addr = bdk.peek_address(KeychainKind::External, index);
-                    // Register the derived address with the local bwt so it
-                    // imports it into the wallet and reports UTXOs here.
-                    if let Err(e) = track::register(&addr.to_string()) {
-                        log::debug!("📡 track singlesig #{} failed: {}", index, e);
-                    }
-                    let sh = electrum::scripthash_hex(addr.script_pubkey().as_bytes());
-                    match electrum::list_unspent(&host, port, &sh) {
-                        Ok(utxos) => {
-                            for u in utxos {
-                                items.push(crate::utxo::UtxoDisplayItem {
-                                    txid_short: u.tx_hash.chars().take(12).collect(),
-                                    value_sats: u.value_sats,
-                                    is_doxxic: false,
-                                    anonset: 0,
-                                    mix_state_icon: "⛓".into(),
-                                    reviewed: false,
-                                });
-                            }
-                        }
-                        Err(e) => log::debug!("💰 singlesig electrum #{}: {}", index, e),
-                    }
-                }
+                let items: Vec<crate::utxo::UtxoDisplayItem> = found
+                    .iter()
+                    .map(|u| crate::utxo::UtxoDisplayItem {
+                        txid_short: u.outpoint.txid.to_string().chars().take(12).collect(),
+                        value_sats: u.prevout.value.to_sat(),
+                        is_doxxic: false,
+                        anonset: 0,
+                        mix_state_icon: "⛓".into(),
+                        reviewed: false,
+                    })
+                    .collect();
                 let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         set_balance_ui(&ui, items);
@@ -3185,6 +3596,7 @@ fn pick_largest_vault_utxo(cb: &DojoSignerCallbacks) -> Option<VaultUtxo> {
 /// AGGREGATE payment code blinded by HMAC-SHA512(outpoint, x). The recipient
 /// unblinds it with its own key, learns the vault's code, and can derive the
 /// same payment address — private, never exposing any single device's key.
+#[allow(unreachable_code)]
 fn build_vault_notification_psbt(
     pc: &bip47::PaymentCode,
     vcfg: &vault::VaultConfig,
@@ -3206,6 +3618,14 @@ fn build_vault_notification_psbt(
         Amount, FeeRate, Network,
     };
     use std::str::FromStr;
+
+    // HOSTED: the bdk wallet graph is never synced — build the notification
+    // from a REAL discovered designated input (blinding + OP_RETURN + dust).
+    #[cfg(not(keyos))]
+    {
+        let payload = bip47::payload_from_code(&vcfg.payment_code()?);
+        return build_hosted_notification_psbt(pc, &payload);
+    }
 
     let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
 
