@@ -39,6 +39,7 @@ mod bip47;
 mod cred;
 mod electrum;
 mod relay;
+mod track;
 mod musig;
 mod vault;
 mod coinjoin;
@@ -285,8 +286,11 @@ fn derive_receive_address(index: u32) -> Result<String, String> {
 /// Stored as JSON on the device filesystem (AppData), restored on startup.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct AppConfig {
+    #[serde(default = "default_node_host")]
     host: String,
+    #[serde(default = "default_node_port")]
     port: u16,
+    #[serde(default)]
     ssl: bool,
     username: String,
     /// The Dojo node password. Legacy configs stored it here in plaintext;
@@ -343,6 +347,17 @@ fn default_relay() -> String {
     "127.0.0.1:8787".into()
 }
 
+/// Default node endpoint: the box's local bwt Electrum server (plain TCP).
+/// The hosted simulator reaches the node directly; on hardware the companion
+/// fronts the same endpoint over quantum-link.
+fn default_node_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_node_port() -> u16 {
+    50001
+}
+
 /// Render the persisted BIP47 verification history for the Verify page.
 fn render_verify_history(history: &[message::VerificationHistoryEntry]) -> String {
     if history.is_empty() {
@@ -381,6 +396,15 @@ fn load_app_config() -> AppConfig {
     };
     if cfg.pool_id.is_empty() {
         cfg.pool_id = "0.5btc".into();
+    }
+    // Normalize a fresh/legacy config to the box's local bwt Electrum endpoint
+    // (plain TCP). AppConfig::default() (no config.json yet) has an empty host,
+    // which would silently disable vault balance auto-discovery.
+    if cfg.host.is_empty() {
+        cfg.host = default_node_host();
+    }
+    if cfg.port == 0 {
+        cfg.port = default_node_port();
     }
     cfg
 }
@@ -1261,7 +1285,7 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
         let global = ui.global::<DojoSignerCallbacks>();
         global.on_connect_node(move |host: SharedString, port: SharedString, ssl: bool, username: SharedString, password: SharedString| {
             let ui = ui_weak.unwrap();
-            let port_i: u16 = port.parse().unwrap_or(50002);
+            let port_i: u16 = port.parse().unwrap_or(50001);
             let host_s = host.to_string();
             log::info!("🔌 Connecting to node: {}:{} (SSL={})", host_s, port_i, ssl);
 
@@ -1927,6 +1951,14 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                     // re-offer this address (derivation is deterministic).
                     cfg.vault_receive_index = idx + 1;
                     save_app_config(&cfg);
+                    // MuSig2 taproot addresses can't be derived from any
+                    // single xpub, so tell the local bwt to watch this one
+                    // (the exact index the discovery loop queries).
+                    if let Ok(taproot_addr) = vcfg.receive_taproot_address(idx) {
+                        if let Err(e) = track::register(&taproot_addr) {
+                            log::debug!("📡 track vault #{} failed: {}", idx, e);
+                        }
+                    }
                     let cb = ui.global::<DojoSignerCallbacks>();
                     cb.set_vault_receive_addr(addr.clone().into());
                     let qr = qrcode::render(
@@ -2993,6 +3025,15 @@ fn refresh_vault_balance(ui: &AppWindow) {
                         continue;
                     }
                 };
+                // MuSig2 taproot addresses can't be derived from any single
+                // xpub, so register this derived P2TR address with the local
+                // bwt — the same address the scripthash below queries. bwt
+                // imports it on its next sync and then reports UTXOs here.
+                if let Ok(taproot_addr) = vcfg.receive_taproot_address(index) {
+                    if let Err(e) = track::register(&taproot_addr) {
+                        log::debug!("📡 track #{} failed: {}", index, e);
+                    }
+                }
                 let script = vault::p2tr_script(&q);
                 let sh = electrum::scripthash_hex(script.as_bytes());
                 match electrum::list_unspent(&host, port, &sh) {

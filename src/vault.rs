@@ -196,8 +196,8 @@ impl VaultConfig {
 
     /// A taproot (P2TR) receive address for the vault: child `index` of the
     /// aggregate payment code, tweaked to the P2TR output key. Senders pay
-    /// the vault to bc1p… addresses; the 4-round ceremony spends them.
-    #[allow(dead_code)] // P2TR receive API — test-exercised; wired into the receive-QR flow later
+    /// the vault to bc1p… addresses; the 4-round ceremony spends them. Also
+    /// the address registered with the local bwt so balances auto-discover.
     pub fn receive_taproot_address(&self, index: u32) -> Result<String, VaultError> {
         let (_, _, q) = self.taproot_context(index)?;
         let spk = p2tr_script(&q);
