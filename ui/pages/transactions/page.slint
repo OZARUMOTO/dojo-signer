@@ -1,0 +1,47 @@
+import { DojoSignerCallbacks as CB } from "../../dojo-signer-callbacks.slint";
+import { BasePage } from "@ui/widgets.slint";
+
+export component TransactionsPage inherits BasePage {
+    VerticalLayout {
+        padding: 4px; spacing: 4px;
+
+        Rectangle {
+            height: 28px; background: #0a0000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 4px;
+                Text { text: "# Transactions"; color: #ff2020; font-size: 14px; font-weight: 600; }
+            }
+        }
+
+        Rectangle {
+            background: #000; border-radius: 2px; border-width: 1px; border-color: #330000;
+            VerticalLayout { padding: 6px; spacing: 4px;
+
+                Text { text: "Checking account history (via your node's Electrum)"; color: #888; font-size: 9px; }
+                Text { text: CB.tx-status; color: #fa0; font-size: 10px; font-weight: 600; }
+
+                Rectangle {
+                    height: 20px; background: #220; border-radius: 2px; border-width: 1px; border-color: #550;
+                    TouchArea { clicked => { CB.refresh-txns(); } }
+                    Text { text: "🔄 REFRESH HISTORY"; color: #fa0; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+
+                Text {
+                    text: CB.tx-history;
+                    color: #ccc; font-size: 9px;
+                    wrap: word-wrap;
+                    vertical-alignment: top;
+                }
+
+                Text { text: "Amount is the net flow to this wallet (+ received / − sent)."; color: #555; font-size: 8px; }
+
+                Rectangle {
+                    height: 18px; background: #0a0000; border-radius: 2px;
+                    TouchArea { clicked => { CB.goto-home(); } }
+                    Text { text: "[back]"; color: #c44; font-size: 9px;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                }
+            }
+        }
+    }
+}

@@ -44,6 +44,15 @@ export global DojoSignerCallbacks {
     in-out property <string> mix-input-sats: "0 sats";
     in-out property <string> pool-selection: "0.5btc";
 
+    // Whirlpool live stats (via the box relay -> whirlpoolstats.xyz)
+    in-out property <string> stats-status: "—";
+    in-out property <string> stats-pools: "";
+    in-out property <string> stats-txs: "";
+
+    // Transactions / history
+    in-out property <string> tx-status: "Tap refresh to load";
+    in-out property <string> tx-history: "";
+
     // Verify page
     in-out property <string> verify-result: "";
     in-out property <string> verify-error: "";
@@ -128,6 +137,11 @@ export global DojoSignerCallbacks {
     callback approve-coinjoin();
     callback reject-coinjoin();
     callback select-pool(string);
+    callback refresh-stats();
+
+    // Transactions / history
+    callback goto-transactions();
+    callback refresh-txns();
 
     // MuSig2 Vault
     callback vault-export-setup();

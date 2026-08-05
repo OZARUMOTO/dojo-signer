@@ -68,6 +68,23 @@ export component CoinjoinPage inherits BasePage {
                 Text { text: "Progress: " + CB.mix-progress + "%"; color: #666; font-size: 9px; }
                 Text { text: CB.mix-error; color: #f00; font-size: 9px; }
 
+                // Live pool stats (via box relay -> whirlpoolstats.xyz)
+                Rectangle {
+                    background: #000; border-radius: 2px; border-width: 1px; border-color: #303;
+                    VerticalLayout { padding: 4px; spacing: 2px;
+                        Text { text: "⚡ LIVE POOL STATS — Whirlpool.Observer"; color: #f6f; font-size: 10px; font-weight: 700; }
+                        Text { text: CB.stats-status; color: #888; font-size: 9px; }
+                        Text { text: CB.stats-pools; color: #cfc; font-size: 9px; }
+                        Text { text: CB.stats-txs; color: #9cf; font-size: 9px; }
+                        Rectangle {
+                            height: 16px; background: #303; border-radius: 2px; border-color: #606; border-width: 1px;
+                            TouchArea { clicked => { CB.refresh-stats(); } }
+                            Text { text: "🔄 REFRESH STATS"; color: #f6f; font-size: 9px; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                }
+
                 GridLayout { spacing: 4px;
                     Rectangle {
                         height: 24px; background: #020; border-radius: 2px; border-width: 1px; border-color: #050;

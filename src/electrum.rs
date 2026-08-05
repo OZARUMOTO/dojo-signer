@@ -39,6 +39,29 @@ pub struct ElectrumUtxo {
     pub height: i64,
 }
 
+/// One entry from `blockchain.scripthash.get_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElectrumHistoryEntry {
+    /// Transaction id in display byte order.
+    pub tx_hash: String,
+    /// Confirmation height; 0 when still in the mempool.
+    pub height: i64,
+}
+
+/// Verbose transaction data from `blockchain.transaction.get` (verbose=true).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElectrumTx {
+    pub txid: String,
+    /// Confirmation count; 0 when unconfirmed.
+    pub confirmations: i64,
+    /// Unix seconds the block was mined (0 when unknown/unconfirmed).
+    pub block_time: i64,
+    /// (value_sats, script_hex) of every input's prevout.
+    pub inputs: Vec<(u64, String)>,
+    /// (value_sats, script_hex) of every output.
+    pub outputs: Vec<(u64, String)>,
+}
+
 #[derive(Debug)]
 pub enum ElectrumError {
     Io(String),
@@ -68,15 +91,17 @@ pub fn scripthash_hex(script: &[u8]) -> String {
     hex::encode(rev)
 }
 
-/// Query `blockchain.scripthash.listunspent` for a single scripthash over a
-/// plain-TCP connection. Returns the unspent outputs (empty when the address
-/// has never received coin), or an error when the server can't be reached or
-/// rejects the query.
-pub fn list_unspent(
+/// Issue one JSON-RPC call over plain TCP and return the `result` value.
+///
+/// Handles both the Content-Length framing used by electrs/Fulcrum and the
+/// bare newline-delimited protocol used by older servers, and surfaces
+/// non-null `error` objects as `ElectrumError::Rpc`.
+fn rpc_call(
     host: &str,
     port: u16,
-    scripthash: &str,
-) -> Result<Vec<ElectrumUtxo>, ElectrumError> {
+    method: &str,
+    params: &[String],
+) -> Result<serde_json::Value, ElectrumError> {
     let addr = (host, port)
         .to_socket_addrs()
         .map_err(|e| ElectrumError::Io(e.to_string()))?
@@ -92,19 +117,17 @@ pub fn list_unspent(
         .set_write_timeout(Some(Duration::from_secs(8)))
         .map_err(|e| ElectrumError::Io(e.to_string()))?;
 
+    let params_json = serde_json::to_string(params)
+        .map_err(|e| ElectrumError::BadResponse(format!("params encode: {e}")))?;
     let req = format!(
-        "{{\"id\":1,\"method\":\"blockchain.scripthash.listunspent\",\"params\":[\"{}\"]}}\n",
-        scripthash
+        "{{\"id\":1,\"method\":\"{method}\",\"params\":{params_json}}}\n"
     );
     stream
         .write_all(req.as_bytes())
         .and_then(|_| stream.flush())
         .map_err(|e| ElectrumError::Io(e.to_string()))?;
 
-    // electrs / Fulcrum speak HTTP-ish "Content-Length:" framing; some servers
-    // reply with bare newline-delimited JSON. Handle both.
     let body = read_response(&mut stream)?;
-
     let value: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| ElectrumError::BadResponse(format!("json: {e}")))?;
     // Successful JSON-RPC responses carry `"error": null`; only a NON-null
@@ -112,9 +135,24 @@ pub fn list_unspent(
     if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
         return Err(ElectrumError::Rpc(err.to_string()));
     }
-    let result = value
+    value
         .get("result")
-        .and_then(|r| r.as_array())
+        .cloned()
+        .ok_or_else(|| ElectrumError::BadResponse("missing result".into()))
+}
+
+/// Query `blockchain.scripthash.listunspent` for a single scripthash over a
+/// plain-TCP connection. Returns the unspent outputs (empty when the address
+/// has never received coin), or an error when the server can't be reached or
+/// rejects the query.
+pub fn list_unspent(
+    host: &str,
+    port: u16,
+    scripthash: &str,
+) -> Result<Vec<ElectrumUtxo>, ElectrumError> {
+    let result = rpc_call(host, port, "blockchain.scripthash.listunspent", &[scripthash.into()])?;
+    let result = result
+        .as_array()
         .ok_or_else(|| ElectrumError::BadResponse("missing result array".into()))?;
 
     let mut utxos = Vec::new();
@@ -127,6 +165,82 @@ pub fn list_unspent(
         });
     }
     Ok(utxos)
+}
+
+/// Query `blockchain.scripthash.get_history` for a single scripthash: every
+/// transaction that touched the address, with its confirmation height (0 when
+/// still in the mempool). This is the source of the app's transactions list.
+pub fn get_history(
+    host: &str,
+    port: u16,
+    scripthash: &str,
+) -> Result<Vec<ElectrumHistoryEntry>, ElectrumError> {
+    let result = rpc_call(host, port, "blockchain.scripthash.get_history", &[scripthash.into()])?;
+    let result = result
+        .as_array()
+        .ok_or_else(|| ElectrumError::BadResponse("missing result array".into()))?;
+
+    let mut entries = Vec::new();
+    for e in result {
+        entries.push(ElectrumHistoryEntry {
+            tx_hash: e.get("tx_hash").and_then(|h| h.as_str()).unwrap_or("").to_string(),
+            height: e.get("height").and_then(|h| h.as_i64()).unwrap_or(0),
+        });
+    }
+    Ok(entries)
+}
+
+/// Fetch a transaction with its inputs' prevouts (`blockchain.transaction.get`
+/// with verbose=true) so the app can compute net flow for its own addresses.
+pub fn get_tx_verbose(host: &str, port: u16, txid: &str) -> Result<ElectrumTx, ElectrumError> {
+    let result = rpc_call(
+        host,
+        port,
+        "blockchain.transaction.get",
+        &[txid.into(), "true".into()],
+    )?;
+    let obj = result
+        .as_object()
+        .ok_or_else(|| ElectrumError::BadResponse("tx result not an object".into()))?;
+
+    let mut inputs = Vec::new();
+    if let Some(vin) = obj.get("vin").and_then(|v| v.as_array()) {
+        for input in vin {
+            let prevout = input.get("prevout").and_then(|p| p.as_object());
+            let value = prevout
+                .and_then(|p| p.get("value"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let script = prevout
+                .and_then(|p| p.get("scriptPubKey"))
+                .and_then(|s| s.get("hex"))
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+            inputs.push((value, script));
+        }
+    }
+    let mut outputs = Vec::new();
+    if let Some(vout) = obj.get("vout").and_then(|v| v.as_array()) {
+        for output in vout {
+            let value = output.get("value").and_then(|v| v.as_u64()).unwrap_or(0);
+            let script = output
+                .get("scriptPubKey")
+                .and_then(|s| s.get("hex"))
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+            outputs.push((value, script));
+        }
+    }
+
+    Ok(ElectrumTx {
+        txid: obj.get("txid").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+        confirmations: obj.get("confirmations").and_then(|c| c.as_i64()).unwrap_or(0),
+        block_time: obj.get("blocktime").and_then(|t| t.as_i64()).unwrap_or(0),
+        inputs,
+        outputs,
+    })
 }
 
 /// Read a JSON-RPC response body from the socket, handling both the
@@ -250,6 +364,48 @@ mod tests {
         handle.join().unwrap();
         assert!(matches!(err, ElectrumError::Rpc(_)));
         assert!(err.to_string().contains("method not found"));
+    }
+
+    /// A canned server that asserts the request mentions `expect_method` and
+    /// replies with the given body (Content-Length framed).
+    fn canned_server_method(expect_method: &'static str, body: &'static str) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = String::new();
+            let mut reader = BufReader::new(sock.try_clone().unwrap());
+            reader.read_line(&mut req).unwrap();
+            assert!(req.contains(expect_method));
+            let framed = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+            sock.write_all(framed.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn get_history_parses_canned_response() {
+        let body = r#"{"id":1,"result":[{"tx_hash":"aa00000000000000000000000000000000000000000000000000000000000000","height":840000},{"tx_hash":"bb00000000000000000000000000000000000000000000000000000000000000","height":0}],"error":null}"#;
+        let (port, handle) = canned_server_method("blockchain.scripthash.get_history", body);
+        let hist = get_history("127.0.0.1", port, "00").unwrap();
+        handle.join().unwrap();
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].tx_hash, "aa00000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(hist[0].height, 840_000);
+        assert_eq!(hist[1].height, 0);
+    }
+
+    #[test]
+    fn get_tx_verbose_parses_prevouts_and_outputs() {
+        let body = r#"{"id":1,"result":{"txid":"aa00000000000000000000000000000000000000000000000000000000000000","confirmations":42,"blocktime":1712000000,"vin":[{"txid":"cc","vout":0,"prevout":{"value":9000,"scriptPubKey":{"hex":"0011"}}}],"vout":[{"value":5000,"scriptPubKey":{"hex":"0012"}},{"value":3900,"scriptPubKey":{"hex":"0013"}}]},"error":null}"#;
+        let (port, handle) = canned_server_method("blockchain.transaction.get", body);
+        let tx = get_tx_verbose("127.0.0.1", port, "aa00").unwrap();
+        handle.join().unwrap();
+        assert_eq!(tx.txid, "aa00000000000000000000000000000000000000000000000000000000000000");
+        assert_eq!(tx.confirmations, 42);
+        assert_eq!(tx.block_time, 1_712_000_000);
+        assert_eq!(tx.inputs, vec![(9000, "0011".to_string())]);
+        assert_eq!(tx.outputs, vec![(5000, "0012".to_string()), (3900, "0013".to_string())]);
     }
 
     #[test]

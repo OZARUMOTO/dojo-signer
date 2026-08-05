@@ -110,11 +110,11 @@ export component HomePage inherits BasePage {
             }
             Rectangle { background: #110000; border-radius: 2px; border-color: #330000; border-width: 1px;
                 VerticalLayout { padding: 4px;
-                    Text { text: "INFO"; color: #ff2020; font-size: 12px; font-weight: 700;
+                    Text { text: "TXNS"; color: #ff2020; font-size: 12px; font-weight: 700;
                         horizontal-alignment: center; }
-                    Text { text: "v0.1"; color: #660000; font-size: 8px;
+                    Text { text: "history"; color: #660000; font-size: 8px;
                         horizontal-alignment: center; }
-                    TouchArea { clicked => { CB.goto-home(); } }
+                    TouchArea { clicked => { CB.goto-transactions(); } }
                 }
             }
         }

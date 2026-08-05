@@ -87,6 +87,59 @@ pub fn ping(relay: &str) -> Result<(), RelayError> {
     }
 }
 
+/// Fetch live Whirlpool pool statistics through the surf-relay gateway.
+///
+/// The Passport device is BLE-only, so it asks the box (which has internet)
+/// to pull whirlpoolstats.xyz and hand back the JSON. The relay replies with
+/// a `stats-result` envelope carrying `data` = `{ "summary": {...}, "txs": [...] }`.
+pub fn fetch_stats(relay: &str) -> Result<serde_json::Value, RelayError> {
+    let (host, port) = split_addr(relay)?;
+    let addr = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| RelayError::Io(e.to_string()))?
+        .next()
+        .ok_or_else(|| RelayError::Io("no address resolved".into()))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| RelayError::Io(format!("connect {relay}: {e}")))?;
+    // The relay makes two bounded upstream fetches (20s each with the relay's
+    // per-request cap), so allow comfortably more than the worst case here.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(50)))
+        .map_err(|e| RelayError::Io(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| RelayError::Io(e.to_string()))?;
+
+    stream
+        .write_all(b"{\"type\":\"stats\"}\n")
+        .map_err(|e| RelayError::Io(format!("send stats: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| RelayError::Io(format!("flush: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut reply = String::new();
+    reader
+        .read_line(&mut reply)
+        .map_err(|e| RelayError::Io(format!("read stats reply: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(reply.trim())
+        .map_err(|e| RelayError::BadReply(format!("stats reply not json: {e}")))?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("stats-result") {
+        return Err(RelayError::BadReply(format!(
+            "unexpected stats reply: {reply}"
+        )));
+    }
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        if !err.is_empty() {
+            return Err(RelayError::Node(err.to_string()));
+        }
+    }
+    v.get("data")
+        .cloned()
+        .ok_or_else(|| RelayError::BadReply("stats reply missing data".into()))
+}
+
 /// Split a "host:port" relay address into its parts.
 fn split_addr(relay: &str) -> Result<(String, u16), RelayError> {
     let (host, port) = relay
@@ -264,6 +317,48 @@ mod tests {
                 .read_line(&mut line)
                 .unwrap();
             assert!(line.contains("\"type\":\"ping\""), "expected ping, got {line}");
+            sock.write_all(reply.as_bytes()).unwrap();
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn fetch_stats_happy_path() {
+        let reply = "{\"type\":\"stats-result\",\"data\":{\"summary\":{\"tip_height\":961171,\"pools\":[]},\"txs\":[]}}\n";
+        let (port, handle) = canned_stats(reply);
+        let data = fetch_stats(&format!("127.0.0.1:{port}")).unwrap();
+        handle.join().unwrap();
+        assert_eq!(data["summary"]["tip_height"], 961171);
+    }
+
+    #[test]
+    fn fetch_stats_surfaces_relay_error() {
+        let reply = "{\"type\":\"stats-result\",\"error\":\"whirlpoolstats.xyz unreachable\"}\n";
+        let (port, handle) = canned_stats(reply);
+        let err = fetch_stats(&format!("127.0.0.1:{port}")).unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, RelayError::Node(e) if e.contains("unreachable")));
+    }
+
+    #[test]
+    fn fetch_stats_bad_reply_type() {
+        let (port, handle) = canned_stats("{\"type\":\"page\",\"id\":\"1\"}\n");
+        let err = fetch_stats(&format!("127.0.0.1:{port}")).unwrap_err();
+        handle.join().unwrap();
+        assert!(matches!(err, RelayError::BadReply(_)), "got {err:?}");
+    }
+
+    /// A canned relay that answers a stats request with the given reply.
+    fn canned_stats(reply: &'static str) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert!(line.contains("\"type\":\"stats\""), "expected stats, got {line}");
             sock.write_all(reply.as_bytes()).unwrap();
         });
         (port, handle)

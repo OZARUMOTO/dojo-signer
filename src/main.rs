@@ -601,6 +601,183 @@ fn discover_hosted_singlesig(wallet: &NgWallet<NullPersister>) -> anyhow::Result
     Ok(found)
 }
 
+/// Group a satoshi amount with thousands separators (e.g. 1234567 -> 1,234,567).
+fn group_sats(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// HOSTED ONLY. Pull the checking account's transaction history from the box's
+/// bwt Electrum server: register + query `get_history` for every derived BIP84
+/// external/internal script, fetch each unique tx verbosely, compute the net
+/// flow to this wallet, and render newest-first lines (mempool on top).
+#[cfg(not(keyos))]
+fn hosted_singlesig_history(wallet: &NgWallet<NullPersister>) -> anyhow::Result<Vec<String>> {
+    let cfg = load_app_config();
+    if cfg.host.is_empty() || cfg.ssl {
+        return Err(anyhow::anyhow!(
+            "no plain-TCP node configured (host='{}', ssl={})",
+            cfg.host,
+            cfg.ssl
+        ));
+    }
+    let host = cfg.host.clone();
+    let port = cfg.port;
+
+    // 1. Collect every watch script (external + internal) and make sure bwt
+    //    is tracking the addresses (its Electrum only serves indexed ones).
+    let mut our_scripts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut scripthashes: Vec<String> = Vec::new();
+    {
+        let bdk = wallet.bdk_wallet.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        for keychain in [KeychainKind::External, KeychainKind::Internal] {
+            for index in 0..=SINGLESIG_WATCH_DEPTH {
+                let addr = bdk.peek_address(keychain, index);
+                let script_hex = hex::encode(addr.script_pubkey().as_bytes());
+                our_scripts.insert(script_hex);
+                if let Err(e) = track::register(&addr.to_string()) {
+                    log::debug!("📡 track history {:?}#{}: {}", keychain, index, e);
+                }
+                scripthashes.push(electrum::scripthash_hex(addr.script_pubkey().as_bytes()));
+            }
+        }
+    }
+
+    // 2. Merge get_history across all scripts: txid -> best height.
+    let mut heights: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    for sh in &scripthashes {
+        match electrum::get_history(&host, port, sh) {
+            Ok(entries) => {
+                for e in entries {
+                    let prev = heights.get(&e.tx_hash).copied().unwrap_or(-1);
+                    if e.height > prev {
+                        heights.insert(e.tx_hash.clone(), e.height);
+                    }
+                }
+            }
+            Err(e) => log::debug!("📜 history {}: {}", sh, e),
+        }
+    }
+    if heights.is_empty() {
+        return Ok(vec!["No transactions yet — send or receive coin to this account.".into()]);
+    }
+
+    // 3. Fetch each unique tx, compute net flow, newest first.
+    let mut rows: Vec<(i64, String)> = Vec::new();
+    for (txid, height) in &heights {
+        match electrum::get_tx_verbose(&host, port, txid) {
+            Ok(tx) => {
+                let received: u64 = tx
+                    .outputs
+                    .iter()
+                    .filter(|(_, s)| our_scripts.contains(s))
+                    .map(|(v, _)| *v)
+                    .sum();
+                let sent: u64 = tx
+                    .inputs
+                    .iter()
+                    .filter(|(_, s)| our_scripts.contains(s))
+                    .map(|(v, _)| *v)
+                    .sum();
+                let net = received as i64 - sent as i64;
+                let sort_h = if *height == 0 { i64::MAX } else { *height };
+                let loc = if *height > 0 {
+                    format!("#{}", height)
+                } else {
+                    "#mempool".into()
+                };
+                let confs = if tx.confirmations > 0 {
+                    format!("{} conf", tx.confirmations)
+                } else {
+                    "unconfirmed".into()
+                };
+                let short: String = txid.chars().take(10).collect();
+                let tail: String = txid.chars().skip(txid.len().saturating_sub(4)).take(4).collect();
+                rows.push((
+                    sort_h,
+                    format!(
+                        "{}{} sats  {}…{}  {}  {}",
+                        if net >= 0 { "+" } else { "−" },
+                        group_sats(net.unsigned_abs()),
+                        short,
+                        tail,
+                        loc,
+                        confs
+                    ),
+                ));
+            }
+            Err(e) => log::debug!("📜 tx {}: {}", txid, e),
+        }
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    let total = rows.len();
+    // Keep the page on-screen: the Passport is small and this slint fork has no
+    // ScrollView, so render a fixed window with a "+N more" tail line.
+    let mut lines: Vec<String> = rows.into_iter().take(12).map(|(_, l)| l).collect();
+    if total > 12 {
+        lines.push(format!("… +{} more", total - 12));
+    }
+    lines.insert(0, format!("{} txs — checking account (BIP84)", heights.len()));
+    Ok(lines)
+}
+
+/// Format the relay's stats JSON into two compact multi-line strings: the pool
+/// summary (entered/unspent BTC, UTXOs, tx0, cycles, tip) and recent mixes.
+fn format_stats(data: &serde_json::Value) -> (String, String) {
+    let summary = data.get("summary");
+    let mut pool_lines: Vec<String> = Vec::new();
+    if let Some(pools) = summary.and_then(|s| s.get("pools")).and_then(|p| p.as_array()) {
+        for p in pools {
+            let label = p.get("label").and_then(|l| l.as_str()).unwrap_or("pool");
+            let entered = p.get("entered_btc").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let unspent = p.get("unspent_btc").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let utxos = p.get("unspent_utxos").and_then(|v| v.as_u64()).unwrap_or(0);
+            let tx0 = p.get("tx0_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let cycles = p.get("cycles").and_then(|v| v.as_u64()).unwrap_or(0);
+            pool_lines.push(format!(
+                "{label}: {unspent:.3}/{entered:.3} BTC free — {utxos} UTXOs, {tx0} tx0, {cycles} cycles"
+            ));
+        }
+    }
+    if pool_lines.is_empty() {
+        pool_lines.push("no live pools reported".into());
+    }
+    let tip = summary
+        .and_then(|s| s.get("tip_height"))
+        .and_then(|t| t.as_i64())
+        .unwrap_or(0);
+    let synced = summary
+        .and_then(|s| s.get("is_synced"))
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+    if tip > 0 {
+        pool_lines.insert(0, format!("tip #{tip} — synced={synced}"));
+    }
+
+    let mut tx_lines: Vec<String> = Vec::new();
+    if let Some(items) = data.get("txs").and_then(|t| t.as_array()) {
+        for t in items.iter().take(3) {
+            let txid = t.get("txid").and_then(|x| x.as_str()).unwrap_or("");
+            let pool = t.get("pool_label").and_then(|p| p.as_str()).unwrap_or("");
+            let h = t.get("block_height").and_then(|x| x.as_i64()).unwrap_or(0);
+            let short: String = txid.chars().take(10).collect();
+            let tail: String = txid.chars().skip(txid.len().saturating_sub(4)).take(4).collect();
+            tx_lines.push(format!("mix {short}…{tail} #{h} ({pool})"));
+        }
+    }
+    if tx_lines.is_empty() {
+        tx_lines.push("no recent mixes reported".into());
+    }
+    (pool_lines.join("\n"), tx_lines.join("\n"))
+}
+
 /// HOSTED ONLY. Build + sign a PSBT sending `amount_sats` to `dest_script`
 /// using REAL UTXOs discovered through the box's bwt Electrum server. Manual
 /// greedy coin selection (largest first), a fresh persisted internal change
@@ -1355,6 +1532,7 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 ui.global::<Navigate>().invoke_coinjoin(NavigateOptions {
                     replace: false, animate: Animate::None,
                 });
+                refresh_stats_ui(&ui);
             }
         });
         global.on_goto_verify({
@@ -1373,6 +1551,16 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
                 ui.global::<Navigate>().invoke_vault(NavigateOptions {
                     replace: false, animate: Animate::None,
                 });
+            }
+        });
+        global.on_goto_transactions({
+            let ui_weak = ui_weak.clone();
+            move || {
+                let ui = ui_weak.unwrap();
+                ui.global::<Navigate>().invoke_transactions(NavigateOptions {
+                    replace: false, animate: Animate::None,
+                });
+                refresh_txns_ui(&ui);
             }
         });
     }
@@ -1411,6 +1599,28 @@ fn app_main(_cx: AppContext, ui: AppWindow) {
             refresh_balance(&ui);
             refresh_vault_balance(&ui);
             log::info!("💰 Balance refreshed");
+        });
+    }
+
+    // ---- Transactions History Refresh ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_refresh_txns(move || {
+            let ui = ui_weak.unwrap();
+            refresh_txns_ui(&ui);
+            log::info!("📜 History refreshed");
+        });
+    }
+
+    // ---- Whirlpool Live Stats Refresh ----
+    {
+        let ui_weak = ui.as_weak();
+        let global = ui.global::<DojoSignerCallbacks>();
+        global.on_refresh_stats(move || {
+            let ui = ui_weak.unwrap();
+            refresh_stats_ui(&ui);
+            log::info!("⚡ Stats refreshed");
         });
     }
 
@@ -3244,6 +3454,90 @@ const SINGLESIG_WATCH_DEPTH: u32 = 20;
 ///
 /// REAL DEVICE (keyos): the companion syncs the bdk wallet via account
 /// updates over Quantum Link, so the in-wallet path is correct there.
+/// Load the checking account's transaction history into the TXNS page.
+/// HOSTED: real history through the box's bwt Electrum. REAL DEVICE (keyos):
+/// the companion syncs the wallet over QL — show the honest note instead.
+fn refresh_txns_ui(ui: &AppWindow) {
+    #[cfg(not(keyos))]
+    {
+        let cfg = load_app_config();
+        if !cfg.host.is_empty() && !cfg.ssl {
+            let ui_weak = ui.as_weak();
+            std::thread::spawn(move || {
+                let result = (|| -> anyhow::Result<Vec<String>> {
+                    let wallet = create_bip84_wallet(Network::Bitcoin, 0)?;
+                    hosted_singlesig_history(&wallet)
+                })();
+                let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        let cb = ui.global::<DojoSignerCallbacks>();
+                        match result {
+                            Ok(lines) => {
+                                let tx_count = lines.len().saturating_sub(1); // first line is the header
+                                cb.set_tx_history(lines.join("\n").into());
+                                cb.set_tx_status(format!("🟢 {} tx(s) loaded", tx_count).into());
+                            }
+                            Err(e) => {
+                                cb.set_tx_history("".into());
+                                cb.set_tx_status(format!("🔴 {}", e).into());
+                            }
+                        }
+                    }
+                });
+            });
+            return;
+        }
+    }
+    let cb = ui.global::<DojoSignerCallbacks>();
+    cb.set_tx_history("".into());
+    cb.set_tx_status("Sync via companion (BLE) or connect your node.".into());
+}
+
+/// Pull live Whirlpool pool stats through the box relay (whirlpoolstats.xyz)
+/// and render them on the Coinjoin page. The device has no internet — the
+/// relay fetches and hands back the JSON (same path as broadcast/qrng).
+fn refresh_stats_ui(ui: &AppWindow) {
+    let cfg = load_app_config();
+    let addr = cfg.relay.clone();
+    let cb = ui.global::<DojoSignerCallbacks>();
+    if addr.is_empty() {
+        cb.set_stats_status("⚠️ no relay configured — stats unavailable".into());
+        return;
+    }
+    cb.set_stats_status(format!("⏳ fetching from {}…", addr).into());
+    let ui_weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let result = crate::relay::fetch_stats(&addr);
+        let _ = slint_keyos_platform::slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let cb = ui.global::<DojoSignerCallbacks>();
+                match result {
+                    Ok(data) => {
+                        let (pools, txs) = format_stats(&data);
+                        cb.set_stats_pools(pools.clone().into());
+                        cb.set_stats_txs(txs.into());
+                        let tip = data
+                            .pointer("/summary/tip_height")
+                            .and_then(|t| t.as_i64())
+                            .unwrap_or(0);
+                        if tip > 0 {
+                            cb.set_stats_status(format!("🟢 live — tip #{}", tip).into());
+                        } else {
+                            cb.set_stats_status("🟢 live".into());
+                        }
+                        log::info!("⚡ Whirlpool stats refreshed");
+                    }
+                    Err(e) => {
+                        cb.set_stats_pools("".into());
+                        cb.set_stats_txs("".into());
+                        cb.set_stats_status(format!("🔴 {}", e).into());
+                    }
+                }
+            }
+        });
+    });
+}
+
 fn refresh_balance(ui: &AppWindow) {
     #[cfg(not(keyos))]
     {
