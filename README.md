@@ -9,6 +9,8 @@ DOJO SIGNER is a [KeyOS](https://docs.foundation.xyz/) app for the [Foundation P
 - A **MuSig2 (BIP-327) 3-of-3 vault** — three Passport Primes aggregate into ONE payment-code identity ("the savings vault") with QR-only 4-round signing. No single device ever holds the vault's key
 - A **Whirlpool coinjoin signing device** — parses real PSBTs from a companion app over Quantum Link BLE, lets you review inputs on the secure display, and signs with the secure element
 - A **UTXO coin control console** — real balance and unspent outputs from the wallet
+- A **transaction history console** — real checking-account history (net flow per tx, confirmations) straight from your node's Electrum
+- **Live Whirlpool pool stats** — entered/unspent BTC, tx0 counts, cycles, and recent mixes from whirlpoolstats.xyz, fetched through the surf-relay gateway
 
 Every cryptographic derivation in this app is verified byte-for-byte against the **official Samourai BIP47 test vectors** and the **official `bitcoin/bips` BIP-327 test vectors** (see [Testing](#-testing)).
 
@@ -221,9 +223,24 @@ Real `SigningRequest` handling — the protocol types come from the actual Ashig
 - BLE companion status + pairing events shown in Settings
 
 ### 🪙 UTXO Coin Control
-- Real balance from `bdk_wallet` (`list_unspent`)
+- Real balance + unspent outputs via **bwt Electrum discovery** (hosted/box setup): every derived BIP84 address (external **and** internal/change) is registered with the box's bwt (`POST /track_address`), then queried through `blockchain.scripthash.listunspent` — the same real path the vault uses
 - Total count, total value, doxxic count, premix/postmix counts, average anonset
 - Displayed in BTC or sats
+- The discovered UTXOs feed the actual **send path** (`build_hosted_signed_psbt`: real largest-first coin selection, RBF, fresh persisted change address) — no more empty-wallet sends
+- On hardware (keyos), the companion syncs the bdk wallet over Quantum Link instead
+
+### 📜 Transactions — checking account history
+- **TXNS page** (`/transactions`, the home tile): real history for the BIP84 checking account
+- Pulls `blockchain.scripthash.get_history` for every derived receive + change address, then `blockchain.transaction.get` (verbose) for each unique tx
+- Each row shows the **net flow to this wallet** (+ received / − sent, computed from input prevouts and outputs), short txid, block height and confirmations — mempool entries on top
+- Capped to a screen-safe 12 rows + "+N more"; `REFRESH HISTORY` button + auto-load on page entry
+- Works because the box's bwt tracks these addresses: every tx in the list is indexed and resolvable
+
+### ⚡ Live Whirlpool Pool Stats
+- The Passport is BLE-only and never opens sockets, so live stats ride the **surf-relay gateway** (a `stats` envelope, same transport as broadcast/qrng)
+- The relay fetches `whirlpoolstats.xyz/api/summary` + `/api/txs` and hands the JSON to the device (60s cache, per-request timeout bounded so the device's read window is never exceeded)
+- Coinjoin page shows: per-pool **entered/unspent BTC**, **unspent UTXOs**, **tx0 count**, **cycles**, **tip height** + sync state, and the most recent mixes
+- Auto-refreshes on page entry + a `REFRESH STATS` button
 
 ### 🔗 Node Connection
 - Electrum server settings: **host, port, SSL, username, password**
@@ -233,6 +250,7 @@ Real `SigningRequest` handling — the protocol types come from the actual Ashig
 - Editable relay `host:port` (default `127.0.0.1:8787`) on the Settings page
 - **PROBE RELAY** button: `ping`→`pong` against the gateway → 🟢 online / 🔴 offline
 - **Last broadcast** line: the txid or node error from the most recent relay send
+- **Live stats envelope**: `stats` → `stats-result` fetches whirlpoolstats.xyz through the same gateway for the Coinjoin page (no new transport)
 - On hardware the companion routes the same envelope to the relay over HTTP
   (`POST /broadcast`) with fallback to the Electrum path
 
@@ -275,12 +293,12 @@ dojo-signer/
 ├── README.md               # This file
 ├── docs/screenshots/       # Simulator captures (vault walkthrough GIF + vault page + receive-QR PNGs)
 ├── src/
-│   ├── main.rs             # Entry point + app wiring (2,148 lines)
-│   ├── bip47.rs            # BIP47 payment codes, ECDH payment addresses, notification tx (504 lines)
+│   ├── main.rs             # Entry point + app wiring (4,155 lines)
+│   ├── bip47.rs            # BIP47 payment codes, ECDH payment addresses, notification tx (553 lines)
 │   ├── musig.rs            # BIP-327 MuSig2 primitives — key agg, nonce, partial sigs (1,446 lines)
-│   ├── vault.rs            # 3-of-3 vault app layer — config, QR codec, 4-round spend, taproot tx (963 lines)
-│   ├── electrum.rs         # Electrum protocol client — scripthash UTXO discovery for the vault
-│   ├── relay.rs            # surf-relay broadcast client — finalize+broadcast via your node
+│   ├── vault.rs            # 3-of-3 vault app layer — config, QR codec, 4-round spend, taproot tx (1,593 lines)
+│   ├── electrum.rs         # Electrum protocol client — UTXO discovery, get_history + verbose tx (TXNS tab)
+│   ├── relay.rs            # surf-relay client — broadcast, ping, live Whirlpool stats envelopes
 │   ├── cred.rs             # Encrypted-at-rest credential vault (HMAC envelope, derive-key)
 │   ├── coinjoin.rs         # Whirlpool protocol types (v0.23) + base64 helpers
 │   ├── message.rs          # BIP47 message verifier types + history
@@ -290,14 +308,15 @@ dojo-signer/
     ├── dojo-signer-callbacks.slint      # Global callback/property bindings (vault callbacks included)
     ├── dojo-signer-types.slint          # PayNymView / UtxoSummaryView structs
     ├── gen/                             # Generated router/navigation (vault page registered)
-    └── pages/                           # 9 screens
-        ├── home/         # Identity card + navigation (VAULT tile)
+    └── pages/                           # 10 screens
+        ├── home/         # Identity card + navigation (VAULT tile, TXNS tile)
         ├── paynym/       # Full payment code + notification address + QR
         ├── send/         # On-chain + BIP47 send
         ├── receive/      # Real BIP84 receive address + QR
         ├── settings/     # Node config + BLE companion status
         ├── utxo/         # Coin control summary
-        ├── coinjoin/     # Whirlpool review + pool selection
+        ├── coinjoin/     # Whirlpool review + pool selection + live pool stats
+        ├── transactions/ # Checking-account history (net flow, confirmations)
         ├── verify/       # BIP47 message verifier + history
         └── vault/        # MuSig2 3-of-3 vault — build, receive, 4-round spend
 ```
@@ -338,7 +357,7 @@ cd ~/KeyOS && cargo test -p gui-app-dojo-signer --profile hosted
 ```
 
 ```text
-running 48 tests
+running 62 tests
   bip47   (8): base58check_roundtrip, blinding_mask_matches_samourai,
                child_pubkey_matches_samourai, notification_shared_secret_matches_samourai,
                payment_address_matches_samourai, payment_code_parse_samourai,
@@ -347,9 +366,17 @@ running 48 tests
   cred    (5): protect_roundtrips, envelope_hides_plaintext_and_key_material,
                wrong_key_or_tamper_is_rejected, derive_key_is_deterministic_and_domain_separated,
                hmac_matches_rfc4231_known_answer
-  electrum(6): scripthash_matches_known_answers, list_unspent_parses_canned_response,
+  electrum(8): scripthash_matches_known_answers, list_unspent_parses_canned_response,
                list_unspent_empty_result, list_unspent_surfaces_rpc_error,
-               connection_refused_is_io_error, newline_framed_response_parses
+               connection_refused_is_io_error, newline_framed_response_parses,
+               get_history_parses_canned_response,
+               get_tx_verbose_parses_prevouts_and_outputs
+  relay  (10): split_addr_parses_host_port, connection_refused_is_io_error,
+               happy_path_roundtrips_txid, node_error_reply_is_surfaced,
+               bad_reply_type_is_surfaced, ping_ok_when_pong,
+               ping_fails_on_unexpected_reply, fetch_stats_happy_path,
+               fetch_stats_surfaces_relay_error, fetch_stats_bad_reply_type
+  track   (2): register_posts_address_and_parses_2xx, register_surfaces_non_2xx_status
   musig  (13): key_agg_matches_official_bip327_vectors, key_agg_sorted_is_order_independent,
                key_agg_rejects_invalid_pubkeys, nonce_gen_matches_official_bip327_vectors,
                nonce_agg_matches_official_bip327_vectors, sign_matches_official_bip327_vectors,
@@ -374,7 +401,7 @@ running 48 tests
                config_json_never_exposes_plaintext_password,
                vault_balance_auto_discovery_flow
 
-test result: ok. 48 passed; 0 failed
+test result: ok. 62 passed; 0 failed
 ```
 
 These tests caught real bugs before they shipped — an ECDH double-hash in the payment-address derivation, and multiple BIP-327 conformance issues (nonce-gen vector mismatches, tweak-ordering) that were fixed until the primitives matched the official vectors byte-for-byte.
